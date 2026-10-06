@@ -1,0 +1,50 @@
+[project]
+name = "tapyolo"
+version = "0.1.0"
+description = "Interactive single-tap video labeling and ultra-fast YOLO head adaptation"
+readme = "README.md"
+authors = [
+    { name = "alanfrancis442", email = "alan.prime567@gmail.com" }
+]
+requires-python = ">=3.11,<3.13"
+dependencies = [
+    "torch>=2.4.0",
+    "torchvision>=0.19.0",
+    "ultralytics>=8.3.0",
+    "supervision>=0.23.0",
+    "opencv-python-headless>=4.10.0.84",
+    "numpy>=1.26.0,<2.0.0",
+    "onnxruntime-gpu>=1.19.0",
+    "pyyaml>=6.0.2",
+    "pydantic>=2.8.2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3.2",
+    "ruff>=0.6.0",
+    "mypy>=1.11.1",
+]
+
+[project.scripts]
+tapyolo = "tapyolo.main:main"
+
+[build-system]
+requires = ["uv_build>=0.12.3,<0.13.0"]
+build-backend = "uv_build"
+
+[tool.uv]
+managed = true
+package = true
+
+[tool.uv.sources]
+torch = { index = "pytorch-cu124" }
+torchvision = { index = "pytorch-cu124" }
+
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
