@@ -2,11 +2,14 @@ from pathlib import Path
 
 from tapyolo.anchors import ANCHOR_COUNT, ANCHOR_NAMES, generate_anchor_set
 from tapyolo.train import (
+    LABELED_EPOCHS,
+    LABELED_LR0,
     LOSS_MIX_NOTE,
     TrainHyperParams,
     build_train_overrides,
     plan_repetitions,
     train_detection_head,
+    train_labeled_class,
 )
 
 
@@ -111,3 +114,52 @@ def test_train_function_accepts_a_tiny_epoch_budget(tmp_path):
     assert "0.70" in LOSS_MIX_NOTE
     sample = next((tmp_path / "run" / "dataset" / "labels" / "train").glob("novel_*.txt"))
     assert sample.read_text(encoding="utf-8").startswith("5 ")
+
+
+def test_labeled_class_keeps_the_learning_rate(tmp_path):
+    novel = tmp_path / "labeled"
+    (novel / "images").mkdir(parents=True)
+    (novel / "labels").mkdir()
+    (novel / "images" / "key_000.jpg").write_bytes(b"jpeg")
+    (novel / "labels" / "key_000.txt").write_text("0 0.500000 0.500000 0.200000 0.200000\n", encoding="utf-8")
+    captured: dict = {}
+
+    class FakeYOLO:
+        def __init__(self, model):
+            captured["model"] = model
+            self.trainer = None
+
+        def add_callback(self, event, fn):
+            captured.setdefault("callbacks", []).append(event)
+
+        def train(self, **kwargs):
+            captured["kwargs"] = kwargs
+
+    result = train_labeled_class(
+        novel,
+        "ameen",
+        model="yolo11n.pt",
+        device="cpu",
+        project=tmp_path / "run",
+        imgsz=64,
+        batch=4,
+        yolo_factory=FakeYOLO,
+    )
+    kwargs = captured["kwargs"]
+    assert captured["model"] == "yolo11n.pt"
+    assert Path(kwargs["project"]).is_absolute()
+    assert kwargs["project"].endswith("/train")
+    assert kwargs["epochs"] == LABELED_EPOCHS
+    assert kwargs["lr0"] == LABELED_LR0
+    assert kwargs["nbs"] == 4
+    assert kwargs["batch"] == 4
+    assert kwargs["freeze"] == 10
+    assert kwargs["mosaic"] == 0.0
+    assert kwargs["mixup"] == 0.0
+    data = Path(kwargs["data"]).read_text(encoding="utf-8")
+    assert "ameen" in data
+    assert "person" not in data
+    assert str(novel.resolve()) in data
+    assert result.novel_class_id == 0
+    assert result.mix_fraction == 1.0
+    assert result.weights is None

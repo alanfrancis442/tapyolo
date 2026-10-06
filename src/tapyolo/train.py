@@ -16,6 +16,8 @@ MU_NOVEL = 0.70
 FREEZE_LAYERS = 10
 LR0 = 0.001
 DEFAULT_EPOCHS = 12
+LABELED_EPOCHS = 40
+LABELED_LR0 = 0.01
 LOSS_MIX_NOTE = (
     "Novel and anchor images are mixed at μ=0.70 / 0.30 before the Ultralytics loader. "
     "The trainer applies one detection loss to that mixture. "
@@ -146,7 +148,7 @@ def train_detection_head(
 ) -> TrainResult:
     """Fine-tune a detection head. ``yolo_factory`` injects a fake for tests."""
     novel_root = Path(novel_dir)
-    work = Path(project)
+    work = Path(project).resolve()
     work.mkdir(parents=True, exist_ok=True)
     if anchor_dir is None:
         anchors = generate_anchor_set(work / "anchors", count=anchor_count)
@@ -201,6 +203,112 @@ def train_detection_head(
         anchor_class_ids=list(range(len(anchor_names))),
         mix_fraction=plan.novel_fraction,
         note=LOSS_MIX_NOTE,
+    )
+
+
+def train_labeled_class(
+    novel_dir: Path,
+    class_name: str,
+    *,
+    epochs: int = LABELED_EPOCHS,
+    model: str = "yolo11n.pt",
+    device: str = "cpu",
+    project: Path | str = "runs/tapyolo",
+    imgsz: int = 640,
+    batch: int = 4,
+    yolo_factory=None,
+    progress_callback=None,
+) -> TrainResult:
+    """Train one new class from the boxes the user drew.
+
+    Ultralytics scales ``lr0`` by ``batch / nbs`` and prefixes a relative project
+    with its global runs directory. This run keeps the requested learning rate
+    and writes weights under ``project``. Mosaic stays off because a handful of
+    orientations is not enough to survive a four-image mosaic.
+    """
+    novel_root = Path(novel_dir).resolve()
+    work = Path(project).resolve()
+    dataset = work / "labeled-data"
+    dataset.mkdir(parents=True, exist_ok=True)
+    data_yaml = dataset / "data.yaml"
+    data_yaml.write_text(
+        yaml.safe_dump(
+            {
+                "path": str(novel_root),
+                "train": "images",
+                "val": "images",
+                "names": {0: class_name},
+            },
+            sort_keys=False,
+        ),
+        encoding="utf-8",
+    )
+    safe_batch = max(1, int(batch))
+    overrides = {
+        "data": str(data_yaml),
+        "epochs": epochs,
+        "lr0": LABELED_LR0,
+        "lrf": 0.1,
+        "freeze": FREEZE_LAYERS,
+        "mosaic": 0.0,
+        "mixup": 0.0,
+        "close_mosaic": 0,
+        "optimizer": "AdamW",
+        "hsv_h": 0.015,
+        "hsv_s": 0.7,
+        "hsv_v": 0.4,
+        "scale": 0.5,
+        "degrees": 15.0,
+        "imgsz": imgsz,
+        "batch": safe_batch,
+        "nbs": safe_batch,
+        "warmup_epochs": 1,
+        "device": device,
+        "project": str(work / "train"),
+        "name": "head",
+        "exist_ok": True,
+        "workers": 0,
+        "plots": False,
+        "patience": epochs,
+        "verbose": False,
+        "amp": str(device).startswith("cuda"),
+    }
+    if yolo_factory is None:
+        from ultralytics import YOLO
+
+        yolo_factory = YOLO
+    yolo = yolo_factory(model)
+    state = {"started": None, "done": 0}
+
+    def on_train_epoch_end(trainer) -> None:
+        import time
+
+        if state["started"] is None:
+            state["started"] = time.perf_counter()
+        state["done"] += 1
+        total = int(getattr(trainer, "epochs", epochs))
+        elapsed = time.perf_counter() - state["started"]
+        remaining = max(0.0, (total - state["done"]) * (elapsed / state["done"]))
+        if progress_callback is not None:
+            progress_callback(state["done"], total, remaining)
+
+    if hasattr(yolo, "add_callback"):
+        yolo.add_callback("on_train_epoch_end", on_train_epoch_end)
+    yolo.train(**overrides)
+    save_dir = Path(getattr(getattr(yolo, "trainer", None), "save_dir", work / "train" / "head"))
+    weights = _find_weights(save_dir)
+    note = f"Trained {class_name} on the segmented object."
+    return TrainResult(
+        data_yaml=str(data_yaml),
+        dataset_root=str(novel_root),
+        save_dir=str(save_dir),
+        weights=str(weights) if weights else None,
+        device=device,
+        epochs=epochs,
+        novel_class_id=0,
+        anchor_class_ids=[],
+        mix_fraction=1.0,
+        note=note,
     )
 
 

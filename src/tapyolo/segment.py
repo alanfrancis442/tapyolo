@@ -199,6 +199,139 @@ def load_segmenter(roots: list[Path] | None = None) -> SegmenterChoice:
         return SegmenterChoice(FallbackSegmenter(), onnx_error=str(exc))
 
 
+def segment_box(image: np.ndarray, box: tuple[int, int, int, int]) -> np.ndarray:
+    """Separate the object inside a drawn rectangle from the wall and the hand.
+
+    The color along the box edge is treated as background. Skin-colored pixels
+    are treated as background too, so a loose box does not keep the whole room.
+    """
+    cv2 = _cv2()
+    frame = np.ascontiguousarray(image)
+    if frame.ndim == 2:
+        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+    height, width = frame.shape[:2]
+    x1, y1, x2, y2 = _clip_box(box, width, height)
+    mask = np.zeros((height, width), np.uint8)
+    if x2 - x1 < 2 or y2 - y1 < 2:
+        return mask
+    roi = frame[y1 : y2 + 1, x1 : x2 + 1]
+    grab = _mask_grabcut(roi)
+    cluster = _mask_cluster(roi)
+    chosen = grab if _mask_quality(roi, grab) >= _mask_quality(roi, cluster) else cluster
+    chosen = _grow_into_object(roi, chosen)
+    box_area = roi.shape[0] * roi.shape[1]
+    if int(chosen.sum()) < max(16, int(0.02 * box_area)):
+        chosen = np.ones(roi.shape[:2], np.uint8)
+    mask[y1 : y2 + 1, x1 : x2 + 1] = (chosen > 0).astype(np.uint8)
+    return mask
+
+
+def object_mask(image: np.ndarray, box: tuple[int, int, int, int]) -> np.ndarray:
+    """Mask used for training.
+
+    A segmented object is kept when it covers a real part of the box. A tiny
+    fragment falls back to the whole box so the pale body of the object is not
+    thrown away.
+    """
+    mask = segment_box(image, box)
+    height, width = image.shape[:2]
+    x1, y1, x2, y2 = _clip_box(box, width, height)
+    area = max(1, (x2 - x1 + 1) * (y2 - y1 + 1))
+    if int(mask.sum()) < 0.12 * area:
+        full = np.zeros((height, width), np.uint8)
+        full[y1 : y2 + 1, x1 : x2 + 1] = 1
+        return full
+    return mask
+
+
+def scene_without_object(image: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """The same frame with the segmented object painted out.
+
+    Training treats this as background, so the room and the person are not enough
+    on their own to count as the object.
+    """
+    cv2 = _cv2()
+    frame = np.ascontiguousarray(image)
+    if frame.ndim == 2:
+        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+    hole = (np.asarray(mask) > 0).astype(np.uint8) * 255
+    if hole.shape[:2] != frame.shape[:2] or int(hole.sum()) < 16:
+        return frame.copy()
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+    hole = cv2.dilate(hole, kernel)
+    return cv2.inpaint(frame, hole, 3, cv2.INPAINT_TELEA)
+
+
+def training_views(
+    image: np.ndarray,
+    box: tuple[int, int, int, int],
+    mask: np.ndarray,
+    *,
+    copies: int = 5,
+    rng: np.random.Generator | None = None,
+) -> list[tuple[np.ndarray, tuple[int, int, int, int]]]:
+    """Real frame first, then the same object on other backgrounds."""
+    frame = np.ascontiguousarray(image)
+    views = [(frame, tuple(int(value) for value in box))]
+    views.extend(cutout_views(frame, mask, copies=copies, rng=rng))
+    return views
+
+
+def cutout_views(
+    image: np.ndarray,
+    mask: np.ndarray,
+    *,
+    copies: int = 5,
+    rng: np.random.Generator | None = None,
+) -> list[tuple[np.ndarray, tuple[int, int, int, int]]]:
+    """Paste the segmented object onto new backgrounds.
+
+    The first view keeps the object's place in the frame. The rest move and
+    scale it, so the only pixels shared by every sample are the object itself.
+    """
+    cv2 = _cv2()
+    frame = np.ascontiguousarray(image)
+    if frame.ndim == 2:
+        frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
+    binary = (np.asarray(mask) > 0).astype(np.uint8)
+    if binary.shape[:2] != frame.shape[:2]:
+        raise ValueError("mask and image sizes differ")
+    bounds = mask_to_bbox(binary)
+    if bounds is None:
+        return []
+    if rng is None:
+        rng = np.random.default_rng(0)
+    x1, y1, x2, y2 = bounds
+    sprite = frame[y1 : y2 + 1, x1 : x2 + 1]
+    alpha = binary[y1 : y2 + 1, x1 : x2 + 1].astype(np.float32)
+    alpha = cv2.GaussianBlur(alpha, (3, 3), 0)
+    height, width = frame.shape[:2]
+    views: list[tuple[np.ndarray, tuple[int, int, int, int]]] = []
+
+    def place(scale: float, left: int, top: int) -> None:
+        nh = max(4, int(round(sprite.shape[0] * scale)))
+        nw = max(4, int(round(sprite.shape[1] * scale)))
+        resized = cv2.resize(sprite, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        scaled = cv2.resize(alpha, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        canvas = _random_background(height, width, rng)
+        tight = _composite(canvas, resized, scaled, left, top)
+        if tight is None:
+            return
+        if tight[2] - tight[0] < 4 or tight[3] - tight[1] < 4:
+            return
+        views.append((canvas, tight))
+
+    place(1.0, x1, y1)
+    for _ in range(max(0, copies)):
+        scale = float(rng.uniform(0.75, 1.2))
+        nh = max(4, int(round(sprite.shape[0] * scale)))
+        nw = max(4, int(round(sprite.shape[1] * scale)))
+        max_left = max(0, width - nw)
+        max_top = max(0, height - nh)
+        place(scale, int(rng.integers(0, max_left + 1)), int(rng.integers(0, max_top + 1)))
+    return views
+
+
 def segment_point(
     image: np.ndarray,
     x: int,
@@ -225,6 +358,240 @@ def segment_point(
 
 def _clip_point(x: int, y: int, width: int, height: int) -> tuple[int, int]:
     return int(min(max(0, x), width - 1)), int(min(max(0, y), height - 1))
+
+
+def _clip_box(
+    box: tuple[int, int, int, int],
+    width: int,
+    height: int,
+) -> tuple[int, int, int, int]:
+    x1, y1, x2, y2 = (int(value) for value in box)
+    left, right = sorted((_clip_point(x1, 0, width, height)[0], _clip_point(x2, 0, width, height)[0]))
+    top, bottom = sorted((_clip_point(0, y1, width, height)[1], _clip_point(0, y2, width, height)[1]))
+    return left, top, right, bottom
+
+
+def _downscale(roi: np.ndarray) -> tuple[np.ndarray, tuple[int, int]]:
+    cv2 = _cv2()
+    height, width = roi.shape[:2]
+    long_side = max(height, width)
+    scale = 1.0 if long_side <= 280 else 280 / long_side
+    resized_w = max(8, int(round(width * scale)))
+    resized_h = max(8, int(round(height * scale)))
+    if (resized_w, resized_h) == (width, height):
+        return roi, (width, height)
+    return cv2.resize(roi, (resized_w, resized_h), interpolation=cv2.INTER_AREA), (width, height)
+
+
+def _edge_band(height: int, width: int) -> np.ndarray:
+    band = max(2, min(height, width) // 12)
+    border = np.zeros((height, width), np.uint8)
+    border[:band, :] = 1
+    border[-band:, :] = 1
+    border[:, :band] = 1
+    border[:, -band:] = 1
+    return border
+
+
+def _skin_mask(image: np.ndarray) -> np.ndarray:
+    """Skin-toned pixels, leaving vivid object colors in the foreground."""
+    cv2 = _cv2()
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    ycrcb = cv2.cvtColor(image, cv2.COLOR_BGR2YCrCb)
+    hue, sat, value = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
+    cr, cb = ycrcb[:, :, 1], ycrcb[:, :, 2]
+    reddish = (hue <= 35) | (hue >= 165)
+    classic = (cr >= 133) & (cr <= 173) & (cb >= 77) & (cb <= 127) & (sat >= 28) & reddish
+    dark = reddish & (sat >= 30) & (value <= 110) & (sat <= 160)
+    vivid = sat >= 140
+    return (classic | dark) & (~vivid)
+
+
+def _wall_distance(image: np.ndarray) -> np.ndarray:
+    cv2 = _cv2()
+    lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB).astype(np.float32)
+    border = _edge_band(*image.shape[:2])
+    background = np.median(lab[border > 0].reshape(-1, 3), axis=0)
+    return np.linalg.norm(lab - background, axis=2)
+
+
+def _fill_holes(binary: np.ndarray) -> np.ndarray:
+    cv2 = _cv2()
+    flood = binary.copy()
+    holes = np.zeros((binary.shape[0] + 2, binary.shape[1] + 2), np.uint8)
+    cv2.floodFill(flood, holes, (0, 0), 2)
+    return np.where(flood == 0, 1, binary).astype(np.uint8)
+
+
+def _keep_component(binary: np.ndarray, seed: np.ndarray | None) -> np.ndarray:
+    cv2 = _cv2()
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(binary, connectivity=8)
+    if count <= 1:
+        return binary
+    best = 1
+    best_score = -1
+    for index in range(1, count):
+        if seed is None:
+            score = int(stats[index, cv2.CC_STAT_AREA])
+        else:
+            score = int(((labels == index) & (seed > 0)).sum())
+        if score > best_score:
+            best_score = score
+            best = index
+    return (labels == best).astype(np.uint8)
+
+
+def _mask_grabcut(roi: np.ndarray) -> np.ndarray:
+    cv2 = _cv2()
+    small, size = _downscale(roi)
+    height, width = small.shape[:2]
+    skin = _skin_mask(small)
+    border = _edge_band(height, width)
+    distance = _wall_distance(small)
+    wall = distance < 16
+    sat = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)[:, :, 1]
+    colorful = (sat >= 50) & (~skin) & (~wall)
+    labels = np.full((height, width), cv2.GC_PR_BGD, np.uint8)
+    labels[skin | wall | (border > 0)] = cv2.GC_BGD
+    labels[colorful] = cv2.GC_FGD
+    labels[(~skin) & (~wall) & (distance >= 16) & (~colorful)] = cv2.GC_PR_FGD
+    background = np.zeros((1, 65), np.float64)
+    foreground = np.zeros((1, 65), np.float64)
+    try:
+        cv2.grabCut(small, labels, None, background, foreground, 3, cv2.GC_INIT_WITH_MASK)
+        binary = np.where((labels == cv2.GC_FGD) | (labels == cv2.GC_PR_FGD), 1, 0).astype(np.uint8)
+    except cv2.error:
+        binary = colorful.astype(np.uint8)
+    binary[skin] = 0
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+    binary = _keep_component(binary, colorful.astype(np.uint8))
+    binary = _fill_holes(binary)
+    binary[skin] = 0
+    return cv2.resize(binary, size, interpolation=cv2.INTER_NEAREST)
+
+
+def _mask_cluster(roi: np.ndarray) -> np.ndarray:
+    cv2 = _cv2()
+    small, size = _downscale(roi)
+    height, width = small.shape[:2]
+    lab = cv2.cvtColor(small, cv2.COLOR_BGR2LAB).astype(np.float32)
+    hsv = cv2.cvtColor(small, cv2.COLOR_BGR2HSV)
+    skin = _skin_mask(small)
+    border = _edge_band(height, width)
+    distance = _wall_distance(small)
+    wall = distance < 18
+    candidate = (~wall) & (~skin)
+    ys, xs = np.nonzero(candidate)
+    foreground = np.zeros((height, width), np.uint8)
+    if len(xs) >= 40:
+        samples = lab[ys, xs].reshape(-1, 3)
+        clusters = 2 if len(xs) >= 80 else 1
+        criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 0.8)
+        _, packed, _ = cv2.kmeans(samples, clusters, None, criteria, 3, cv2.KMEANS_PP_CENTERS)
+        label_map = np.zeros((height, width), np.int32)
+        label_map[ys, xs] = packed.ravel() + 1
+
+        def score(index: int) -> float:
+            selected = label_map == index
+            area = int(selected.sum())
+            if area < 12:
+                return -1e9
+            saturation = float(hsv[:, :, 1][selected].mean())
+            touch = float((selected & (border > 0)).sum()) / area
+            yy, xx = np.nonzero(selected)
+            spread = float(np.sqrt(((yy - yy.mean()) ** 2 + (xx - xx.mean()) ** 2).mean()) / max(np.sqrt(area), 1))
+            return saturation - 140 * touch - 20 * spread
+
+        best = max(range(1, clusters + 1), key=score)
+        foreground = (label_map == best).astype(np.uint8)
+    if int(foreground.sum()) < 16:
+        foreground = candidate.astype(np.uint8)
+    radius = max(2, int(round(0.4 * np.sqrt(max(int(foreground.sum()), 1)))))
+    radius = min(radius, max(2, min(height, width) // 6))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
+    grown = cv2.dilate(foreground, kernel)
+    grown[skin] = 0
+    if int(foreground.sum()):
+        seed = np.median(lab[foreground > 0].reshape(-1, 3), axis=0)
+        near = np.linalg.norm(lab - seed, axis=2) < 38
+        grown = ((grown > 0) & (near | (foreground > 0))).astype(np.uint8)
+    grown = _keep_component(grown, foreground)
+    grown = cv2.morphologyEx(grown, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    grown = _fill_holes(grown)
+    grown[skin] = 0
+    return cv2.resize(grown, size, interpolation=cv2.INTER_NEAREST)
+
+
+def _mask_quality(roi: np.ndarray, mask: np.ndarray) -> float:
+    area = int(mask.sum())
+    if area < 16:
+        return -1e6
+    fraction = area / float(mask.size)
+    cv2 = _cv2()
+    sat = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)[:, :, 1]
+    saturation = float(sat[mask > 0].mean())
+    skin_fraction = float((_skin_mask(roi) & (mask > 0)).sum()) / area
+    penalty = 90.0 if fraction < 0.04 or fraction > 0.7 else 0.0
+    return saturation - 110 * skin_fraction - penalty
+
+
+def _grow_into_object(roi: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    """Include pale parts of the object that sit against the colored seed."""
+    cv2 = _cv2()
+    binary = (mask > 0).astype(np.uint8)
+    if int(binary.sum()) < 16:
+        return binary
+    lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB).astype(np.float32)
+    skin = _skin_mask(roi)
+    seed = np.median(lab[binary > 0].reshape(-1, 3), axis=0)
+    radius = max(2, int(round(0.28 * np.sqrt(float(binary.sum())))))
+    radius = min(radius, max(2, min(roi.shape[:2]) // 8))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
+    grown = cv2.dilate(binary, kernel)
+    near = np.linalg.norm(lab - seed, axis=2) < 42
+    grown = ((grown > 0) & (near | (binary > 0)) & (~skin)).astype(np.uint8)
+    grown = _keep_component(grown, binary)
+    grown = _fill_holes(grown)
+    grown[skin] = 0
+    return grown
+
+
+def _random_background(height: int, width: int, rng: np.random.Generator) -> np.ndarray:
+    cv2 = _cv2()
+    coarse = rng.integers(0, 256, size=(8, 8, 3), dtype=np.uint8)
+    field = cv2.resize(coarse, (width, height), interpolation=cv2.INTER_LINEAR)
+    if rng.random() < 0.5:
+        noise = rng.integers(0, 40, size=(height, width, 1), dtype=np.int16)
+        field = np.clip(field.astype(np.int16) + noise, 0, 255).astype(np.uint8)
+    return field
+
+
+def _composite(
+    canvas: np.ndarray,
+    sprite: np.ndarray,
+    alpha: np.ndarray,
+    left: int,
+    top: int,
+) -> tuple[int, int, int, int] | None:
+    height, width = canvas.shape[:2]
+    sprite_h, sprite_w = sprite.shape[:2]
+    x1, y1 = max(0, left), max(0, top)
+    x2, y2 = min(width, left + sprite_w), min(height, top + sprite_h)
+    if x2 <= x1 or y2 <= y1:
+        return None
+    sx1, sy1 = x1 - left, y1 - top
+    sx2, sy2 = sx1 + (x2 - x1), sy1 + (y2 - y1)
+    part = alpha[sy1:sy2, sx1:sx2].astype(np.float32)
+    if float(part.max()) < 0.2:
+        return None
+    region = canvas[y1:y2, x1:x2].astype(np.float32)
+    blended = part[:, :, None] * sprite[sy1:sy2, sx1:sx2].astype(np.float32) + (1.0 - part[:, :, None]) * region
+    canvas[y1:y2, x1:x2] = blended.astype(np.uint8)
+    ys, xs = np.nonzero(part > 0.35)
+    if xs.size == 0:
+        return None
+    return x1 + int(xs.min()), y1 + int(ys.min()), x1 + int(xs.max()), y1 + int(ys.max())
 
 
 def _usable(mask: np.ndarray) -> bool:
