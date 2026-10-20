@@ -24,6 +24,10 @@ def tap_keyframes(
     x: int,
     y: int,
     segmenter,
+    *,
+    video_tracker=None,
+    tracking_frames=None,
+    keyframe_indices=None,
 ) -> dict:
     if not frames:
         raise ValueError("no keyframes to tap")
@@ -33,12 +37,23 @@ def tap_keyframes(
     if output.bbox is None:
         raise ValueError("segmenter returned an empty mask")
     started = time.perf_counter()
-    propagated = propagate_bidirectional(frames, index, output.bbox)
+    if video_tracker is not None:
+        dense = tracking_frames if tracking_frames else frames
+        mapping = keyframe_indices if tracking_frames else list(range(len(frames)))
+        propagated = video_tracker.propagate(
+            dense, mapping[index], output.mask, mapping
+        )
+    else:
+        propagated = propagate_bidirectional(frames, index, output.bbox)
     track_ms = (time.perf_counter() - started) * 1000.0
     height, width = frames[index].shape[:2]
     tracks = []
     for frame_index, box in enumerate(propagated.boxes):
-        yolo = None if box is None else list(xyxy_to_yolo(box[0], box[1], box[2], box[3], width, height))
+        yolo = (
+            None
+            if box is None
+            else list(xyxy_to_yolo(box[0], box[1], box[2], box[3], width, height))
+        )
         tracks.append(
             {
                 "index": frame_index,

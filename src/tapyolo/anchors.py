@@ -1,8 +1,7 @@
-"""Local rehearsal buffer of 25 multi-class images.
+"""Synthetic rehearsal fixtures for tests and demos.
 
-These stand in for a COCO replay split so training can run without downloading
-COCO. Pass an existing anchor directory to ``train_detection_head`` to use
-real images instead.
+Production training uses real COCO128 photographs installed by tapyolo.setup
+or an explicitly supplied local rehearsal directory.
 """
 
 from __future__ import annotations

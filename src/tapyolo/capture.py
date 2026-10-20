@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 import struct
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
@@ -32,6 +32,7 @@ class CaptureBundle:
     negatives: list[np.ndarray]
     sample_method: str
     warning: str | None
+    tracking_frames: list[np.ndarray] = field(default_factory=list)
 
 
 @dataclass
@@ -112,7 +113,22 @@ def process_frames(frames: list[np.ndarray], fps: float) -> CaptureBundle:
         negatives=[frames[i] for i in negative_idx],
         sample_method=sampled.method,
         warning=warning,
+        tracking_frames=tracking_frames(content_frames),
     )
+
+
+def tracking_frames(frames, max_side=640):
+    """Keep consecutive frames for video memory, bounded in resolution."""
+    cv2 = _cv2()
+    if not frames:
+        return []
+    height, width = frames[0].shape[:2]
+    scale = min(1.0, max_side / max(height, width))
+    size = (max(2, int(width * scale) // 2 * 2), max(2, int(height * scale) // 2 * 2))
+    return [
+        cv2.resize(frame, size) if frame.shape[1::-1] != size else frame
+        for frame in frames
+    ]
 
 
 def save_capture(bundle: CaptureBundle, root: Path) -> SavedCapture:
@@ -140,6 +156,10 @@ def save_capture(bundle: CaptureBundle, root: Path) -> SavedCapture:
         write_empty_label(label)
         neg_paths.append(path)
         neg_labels.append(label)
+    if bundle.tracking_frames:
+        from tapyolo.video_tracker import write_video
+
+        write_video(root / "tracking.avi", bundle.tracking_frames, bundle.fps)
     return SavedCapture(root, key_paths, neg_paths, neg_labels)
 
 
@@ -166,7 +186,13 @@ def read_video(path: Path) -> tuple[list[np.ndarray], float]:
 def decode_video_bytes(data: bytes) -> tuple[list[np.ndarray], float]:
     if not data:
         raise ValueError("video has no frames")
-    suffix = ".avi" if data.startswith(b"RIFF") else ".webm" if data.startswith(b"\x1aE\xdf\xa3") else ".mp4"
+    suffix = (
+        ".avi"
+        if data.startswith(b"RIFF")
+        else ".webm"
+        if data.startswith(b"\x1aE\xdf\xa3")
+        else ".mp4"
+    )
     tmp = tempfile.NamedTemporaryFile(suffix=suffix, delete=False)
     try:
         tmp.write(data)
@@ -211,7 +237,9 @@ def decode_frame_bundle(data: bytes) -> tuple[list[np.ndarray], float]:
         offset += size
         if len(blob) != size:
             raise ValueError("frame bundle ended early")
-        image = cv2.imdecode(np.frombuffer(blob, dtype=np.uint8).copy(), cv2.IMREAD_COLOR)
+        image = cv2.imdecode(
+            np.frombuffer(blob, dtype=np.uint8).copy(), cv2.IMREAD_COLOR
+        )
         if image is None:
             raise ValueError("could not decode a bundled frame")
         frames.append(image)

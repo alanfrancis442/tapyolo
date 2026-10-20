@@ -38,7 +38,9 @@ def score_sets(
     total_gt = 0
     total_tp = 0
     for class_id in classes:
-        ap, recall, gt_count, tp = _average_precision(ground_truth, predictions, class_id, iou_threshold)
+        ap, recall, gt_count, tp = _average_precision(
+            ground_truth, predictions, class_id, iou_threshold
+        )
         per_class[class_id] = ap
         total_gt += gt_count
         total_tp += tp
@@ -82,7 +84,8 @@ def evaluate_retention(
         "novel_recall": novel_stats["recall"],
         "anchor_images": anchor_stats["images"],
         "novel_images": novel_stats["images"],
-        "anchor_detection_retained": anchor_stats["recall"] is not None and anchor_stats["recall"] > 0,
+        "anchor_detection_retained": anchor_stats["recall"] is not None
+        and anchor_stats["recall"] > 0,
         "meets_90_map": meets_map_target(anchor_map),
     }
 
@@ -101,13 +104,17 @@ def _average_precision(
         for pred in image_preds:
             if int(pred[0]) != class_id:
                 continue
-            ranked.append((float(pred[1]), image_index, (pred[2], pred[3], pred[4], pred[5])))
+            ranked.append(
+                (float(pred[1]), image_index, (pred[2], pred[3], pred[4], pred[5]))
+            )
     ranked.sort(key=lambda item: item[0], reverse=True)
     matched = [set() for _ in ground_truth]
     tp: list[int] = []
     fp: list[int] = []
     for _confidence, image_index, box in ranked:
-        candidates = [item for item in ground_truth[image_index] if int(item[0]) == class_id]
+        candidates = [
+            item for item in ground_truth[image_index] if int(item[0]) == class_id
+        ]
         best_iou = 0.0
         best_index = None
         for gt_index, gt in enumerate(candidates):
@@ -144,10 +151,15 @@ def _integrate_ap(recall: np.ndarray, precision: np.ndarray) -> float:
     return float(np.sum((mrec[changes + 1] - mrec[changes]) * mpre[changes + 1]))
 
 
-def _load_split(root: Path, class_map: dict[int, int] | None):
+def _load_split(
+    root: Path,
+    class_map: dict[int, int] | None,
+    image_subdir="images",
+    label_subdir="labels",
+):
     import cv2
 
-    image_dir = root / "images"
+    image_dir = root / image_subdir
     images: list[np.ndarray] = []
     ground_truth: list[list[tuple[int, float, float, float, float]]] = []
     if not image_dir.is_dir():
@@ -159,7 +171,7 @@ def _load_split(root: Path, class_map: dict[int, int] | None):
         if image is None:
             raise ValueError(f"could not read {image_path}")
         height, width = image.shape[:2]
-        label_path = root / "labels" / f"{image_path.stem}.txt"
+        label_path = root / label_subdir / f"{image_path.stem}.txt"
         ground_truth.append(_read_label(label_path, width, height, class_map))
         images.append(image)
     return ground_truth, images
@@ -180,13 +192,20 @@ def _read_label(path: Path, width: int, height: int, class_map: dict[int, int] |
         if class_map is not None:
             class_id = class_map.get(class_id, class_id)
         x_min, y_min, x_max, y_max = yolo_to_xyxy(
-            float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4]), width, height
+            float(parts[1]),
+            float(parts[2]),
+            float(parts[3]),
+            float(parts[4]),
+            width,
+            height,
         )
         boxes.append((class_id, x_min, y_min, x_max, y_max))
     return boxes
 
 
-def _predict(weights, images, device: str, confidence: float, imgsz: int):
+def _predict(
+    weights, images, device: str, confidence: float, imgsz: int, target_names=None
+):
     if not images:
         return []
     from ultralytics import YOLO
@@ -194,7 +213,9 @@ def _predict(weights, images, device: str, confidence: float, imgsz: int):
     model = YOLO(str(weights))
     predictions = []
     for image in images:
-        result = model.predict(image, device=device, conf=confidence, imgsz=imgsz, verbose=False)[0]
+        result = model.predict(
+            image, device=device, conf=confidence, imgsz=imgsz, verbose=False
+        )[0]
         boxes = []
         if result.boxes is not None and len(result.boxes):
             xyxy = result.boxes.xyxy.cpu().numpy()
@@ -202,6 +223,63 @@ def _predict(weights, images, device: str, confidence: float, imgsz: int):
             confs = result.boxes.conf.cpu().numpy()
             for class_id, conf, coords in zip(classes, confs, xyxy):
                 x1, y1, x2, y2 = (float(v) for v in coords.tolist())
+                if target_names is not None:
+                    name = result.names[int(class_id)]
+                    if name not in target_names:
+                        continue
+                    class_id = target_names.index(name)
                 boxes.append((int(class_id), float(conf), x1, y1, x2, y2))
         predictions.append(boxes)
     return predictions
+
+
+def evaluate_training_run(
+    base_weights, tuned_weights, dataset, *, device="cpu", imgsz=640
+):
+    """Compare both models on the same held-out originals, with class names aligned."""
+    import yaml
+
+    config = yaml.safe_load((dataset / "data.yaml").read_text())
+    names = config["names"]
+    names = (
+        [names[index] for index in sorted(names)] if isinstance(names, dict) else names
+    )
+    gt, images = _load_split(dataset, None, "images/val", "labels/val")
+    paths = sorted(
+        path
+        for path in (dataset / "images/val").iterdir()
+        if path.suffix.lower() in {".jpg", ".jpeg", ".png", ".bmp"}
+    )
+    tuned = _predict(tuned_weights, images, device, 0.001, imgsz, names)
+    baseline = _predict(base_weights, images, device, 0.001, imgsz, names)
+    anchor_ids = [i for i, path in enumerate(paths) if path.stem.startswith("anchor_")]
+    novel_ids = [i for i, path in enumerate(paths) if path.stem.startswith("novel_")]
+
+    def stats(predictions, indices):
+        return score_sets([gt[i] for i in indices], [predictions[i] for i in indices])
+
+    before, after = stats(baseline, anchor_ids), stats(tuned, anchor_ids)
+    novel = stats(tuned, novel_ids)
+    ratio = (
+        after["map50"] / before["map50"]
+        if before["map50"] and after["map50"] is not None
+        else None
+    )
+    return {
+        "measured": True,
+        "split": "held-out originals from the same source clips; not independent recordings",
+        "anchor_baseline_map50": before["map50"],
+        "anchor_map50": after["map50"],
+        "anchor_retention_ratio": ratio,
+        "meets_retention_target": ratio is not None and ratio >= 0.90,
+        "meets_90_map": meets_map_target(after["map50"]),
+        "novel_map50": novel["map50"],
+        "novel_recall": novel["recall"],
+        "anchor_images": len(anchor_ids),
+        "novel_images": len(novel_ids),
+        "novel_per_class_ap": novel["per_class_ap"],
+        "confidence_threshold": 0.001,
+        "note": "Retention is unmeasurable when the baseline anchor score is zero."
+        if ratio is None
+        else "Retention compares tuned mAP50 to the measured baseline.",
+    }

@@ -35,8 +35,19 @@ def _clip() -> tuple[list[np.ndarray], float]:
 
 
 def test_startup_loads_the_newest_trained_weights(tmp_path):
-    older = tmp_path / "sessions" / "old" / "run" / "nbs" / "head" / "weights" / "best.pt"
-    newer = tmp_path / "sessions" / "552ef2db5558" / "run" / "train" / "head" / "weights" / "best.pt"
+    older = (
+        tmp_path / "sessions" / "old" / "run" / "nbs" / "head" / "weights" / "best.pt"
+    )
+    newer = (
+        tmp_path
+        / "sessions"
+        / "552ef2db5558"
+        / "run"
+        / "train"
+        / "head"
+        / "weights"
+        / "best.pt"
+    )
     older.parent.mkdir(parents=True)
     newer.parent.mkdir(parents=True)
     older.write_bytes(b"old")
@@ -52,7 +63,9 @@ def test_startup_loads_the_newest_trained_weights(tmp_path):
 
 
 def test_ui_flow_over_http(tmp_path):
-    app = TapYoloApp(model="yolo11n.pt", requested_device="cuda:0", work_root=tmp_path, epochs=12)
+    app = TapYoloApp(
+        model="yolo11n.pt", requested_device="cuda:0", work_root=tmp_path, epochs=12
+    )
     httpd = make_server(app, "127.0.0.1", 0)
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()
@@ -70,7 +83,9 @@ def test_ui_flow_over_http(tmp_path):
         assert 'id="camera"' in html
         assert "Choose camera" in html
 
-        with urllib.request.urlopen(base + "/api/record/frame.jpg", timeout=5) as response:
+        with urllib.request.urlopen(
+            base + "/api/record/frame.jpg", timeout=5
+        ) as response:
             assert response.status == 204
             assert response.read() == b""
 
@@ -78,7 +93,9 @@ def test_ui_flow_over_http(tmp_path):
         preview[:, :] = (40, 180, 20)
         with app.recorder._lock:
             app.recorder._latest = preview
-        with urllib.request.urlopen(base + "/api/record/frame.jpg", timeout=5) as response:
+        with urllib.request.urlopen(
+            base + "/api/record/frame.jpg", timeout=5
+        ) as response:
             assert response.status == 200
             jpeg = response.read()
         assert jpeg[:2] == b"\xff\xd8"
@@ -165,12 +182,22 @@ def test_ui_flow_over_http(tmp_path):
             with urllib.request.urlopen(request, timeout=10) as response:
                 return json.loads(response.read().decode("utf-8"))
 
-        drawn = post_box({"index": 0, "x1": first[0], "y1": first[1], "x2": first[2], "y2": first[3]})
+        drawn = post_box(
+            {"index": 0, "x1": first[0], "y1": first[1], "x2": first[2], "y2": first[3]}
+        )
         assert drawn["bbox"] == list(first)
         assert drawn["labeled_count"] == 1
         assert drawn["boxes"][1] is None
 
-        both = post_box({"index": 1, "x1": second[0], "y1": second[1], "x2": second[2], "y2": second[3]})
+        both = post_box(
+            {
+                "index": 1,
+                "x1": second[0],
+                "y1": second[1],
+                "x2": second[2],
+                "y2": second[3],
+            }
+        )
         assert both["boxes"][0] == list(first)
         assert both["boxes"][1] == list(second)
         assert both["labeled_count"] == 2
@@ -188,14 +215,19 @@ def test_ui_flow_over_http(tmp_path):
             assert exc.code == 400
 
         stored = app.sessions[session["id"]]
+        stored.tail_is_background = True
         exported = app.export_labeled_set(stored)
         names = sorted(path.name for path in (exported / "images").iterdir())
         assert "key_000.jpg" in names
         assert "key_001.jpg" in names
         assert any(name.startswith("key_000_bg") for name in names)
         assert sum(name.startswith("key_") for name in names) > 2
-        assert sum(name.startswith("neg_") for name in names) == session["negative_count"]
-        label = (exported / "labels" / "key_000.txt").read_text(encoding="utf-8").split()
+        assert (
+            sum(name.startswith("neg_") for name in names) == session["negative_count"]
+        )
+        label = (
+            (exported / "labels" / "key_000.txt").read_text(encoding="utf-8").split()
+        )
         assert label[0] == "0"
         assert all(0.0 <= float(value) <= 1.0 for value in label[1:])
         assert (exported / "labels" / "neg_000.txt").read_bytes() == b""
@@ -206,6 +238,39 @@ def test_ui_flow_over_http(tmp_path):
         ) as response:
             png = response.read()
         assert png[:8] == b"\x89PNG\r\n\x1a\n"
+
+        def post_api(path, payload):
+            request = urllib.request.Request(
+                base + path,
+                data=json.dumps(payload).encode(),
+                headers={"Content-Type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return json.loads(response.read())
+
+        tapped = post_api(
+            f"/api/sessions/{session['id']}/tap",
+            {"index": 0, "points": [{"x": 30, "y": 50, "label": 1}]},
+        )
+        assert tapped["backend"] == "fallback"
+        assert tapped["labeled_count"] > 2
+        assert tapped["elapsed_ms"] >= 0
+        assert tapped["track_ms"] >= 0
+        assert (
+            post_api(f"/api/sessions/{session['id']}/propagate", {"index": 0})["boxes"][
+                0
+            ]
+            is not None
+        )
+        record = app.model_status()["models"][0]
+        selected = post_api("/api/model/select", {"id": record["id"]})
+        assert selected["active"] == str(tuned)
+        deleted = post_api("/api/model/delete", {"id": record["id"]})
+        assert deleted["active"] == "yolo11n.pt"
+        assert deleted["models"] == []
+        assert not tuned.exists()
+
     finally:
         httpd.shutdown()
         httpd.server_close()

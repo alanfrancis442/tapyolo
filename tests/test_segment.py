@@ -5,10 +5,10 @@ from tapyolo.segment import (
     FallbackSegmenter,
     cutout_views,
     load_segmenter,
-    training_views,
     prepare_encoder_input,
     scale_point,
     segment_box,
+    training_views,
 )
 
 

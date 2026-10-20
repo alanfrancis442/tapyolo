@@ -13,6 +13,7 @@ from tapyolo.pipeline import load_video, tap_keyframes
 from tapyolo.segment import load_segmenter
 from tapyolo.train import DEFAULT_EPOCHS, train_detection_head
 from tapyolo.ui import TapYoloApp, serve
+from tapyolo.video_tracker import load_video_tracker
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -30,6 +31,11 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--train", action="store_true")
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--anchors", type=Path)
+    parser.add_argument(
+        "--background-tail",
+        action="store_true",
+        help="Confirm the object is absent in the final second",
+    )
     parser.add_argument("--output", type=Path, default=Path("runs/tapyolo"))
     parser.add_argument("--imgsz", type=int, default=640)
     parser.add_argument("--batch", type=int, default=0)
@@ -38,7 +44,9 @@ def main(argv: list[str] | None = None) -> int:
     device = resolve_device(args.device)
     print(f"Resolved device: {device} (requested {args.device}).")
     if args.epochs < 10 or args.epochs > 15:
-        print(f"Epoch budget is {args.epochs}. The short adaptation run uses 10-15 epochs.")
+        print(
+            f"Epoch budget is {args.epochs}. The short adaptation run uses 10-15 epochs."
+        )
 
     if args.video is None:
         app = TapYoloApp(
@@ -48,6 +56,7 @@ def main(argv: list[str] | None = None) -> int:
             epochs=args.epochs,
             imgsz=args.imgsz,
             batch=args.batch,
+            anchor_dir=args.anchors,
         )
         app.device = device
         serve(app, args.host, args.port)
@@ -70,8 +79,17 @@ def main(argv: list[str] | None = None) -> int:
     }
     if args.tap:
         x_text, y_text = args.tap.split(",")
-        choice = load_segmenter()
-        tapped = tap_keyframes(bundle.keyframes, args.keyframe, int(x_text), int(y_text), choice.segmenter)
+        choice = load_segmenter(device=device)
+        tapped = tap_keyframes(
+            bundle.keyframes,
+            args.keyframe,
+            int(x_text),
+            int(y_text),
+            choice.segmenter,
+            video_tracker=load_video_tracker(device=device),
+            tracking_frames=bundle.tracking_frames,
+            keyframe_indices=bundle.keyframe_indices,
+        )
         summary["segmenter"] = tapped["backend"]
         summary["segment_detail"] = tapped["detail"]
         summary["segment_ms"] = tapped["elapsed_ms"]
@@ -79,12 +97,30 @@ def main(argv: list[str] | None = None) -> int:
         summary["track_ms"] = tapped["track_ms"]
         if args.label:
             label = clean_label(args.label)
-            boxes = [None if track["bbox"] is None else tuple(track["bbox"]) for track in tapped["tracks"]]
+            boxes = [
+                None if track["bbox"] is None else tuple(track["bbox"])
+                for track in tapped["tracks"]
+            ]
             stems = [path.stem for path in saved.keyframe_paths]
-            write_tracked_labels(args.output / "labels", stems, boxes, 0, bundle.width, bundle.height)
+            write_tracked_labels(
+                args.output / "labels", stems, boxes, 0, bundle.width, bundle.height
+            )
             (args.output / "classes.txt").write_text(label + "\n", encoding="utf-8")
             summary["label"] = label
             if args.train:
+                if not args.background_tail:
+                    for image, annotation in zip(
+                        saved.negative_paths, saved.negative_label_paths
+                    ):
+                        image.unlink(missing_ok=True)
+                        annotation.unlink(missing_ok=True)
+                # A lost track is unknown, not an empty background annotation.
+                for image, box in zip(saved.keyframe_paths, boxes):
+                    if box is None:
+                        image.unlink(missing_ok=True)
+                        (args.output / "labels" / f"{image.stem}.txt").unlink(
+                            missing_ok=True
+                        )
                 result = train_detection_head(
                     args.output,
                     label,
@@ -99,6 +135,16 @@ def main(argv: list[str] | None = None) -> int:
                 summary["weights"] = result.weights
                 summary["mix_fraction"] = result.mix_fraction
                 summary["train_note"] = result.note
+                if result.weights:
+                    from tapyolo.validate import evaluate_training_run
+
+                    summary["report"] = evaluate_training_run(
+                        args.model,
+                        result.weights,
+                        Path(result.dataset_root),
+                        device=device,
+                        imgsz=args.imgsz,
+                    )
     print(json.dumps(summary, indent=2))
     return 0
 

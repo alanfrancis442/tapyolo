@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+import re
 import shutil
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,7 +11,7 @@ from pathlib import Path
 import yaml
 from pydantic import BaseModel, Field
 
-from tapyolo.anchors import ANCHOR_COUNT, ANCHOR_NAMES, generate_anchor_set
+from tapyolo.anchors import ANCHOR_COUNT
 from tapyolo.labels import remap_label_file
 
 MU_NOVEL = 0.70
@@ -75,23 +77,18 @@ def plan_repetitions(n_novel: int, n_anchor: int, mu: float = MU_NOVEL) -> MixPl
     if not 0.0 < mu < 1.0:
         raise ValueError("mu must be between 0 and 1")
     ratio = mu / (1.0 - mu)
-    base = max(1, int(round(ratio * n_anchor / n_novel)))
-    best: tuple[float, int, float, int, int] | None = None
-    for repeats in range(max(1, base - 2), base + 3):
-        novel_slots = n_novel * repeats
-        anchor_slots = n_anchor
-        fraction = novel_slots / (novel_slots + anchor_slots)
-        error = abs(fraction - mu)
-        if best is None or error < best[0]:
-            best = (error, repeats, fraction, novel_slots, anchor_slots)
-    assert best is not None
-    return MixPlan(
-        novel_repeats=best[1],
-        anchor_repeats=1,
-        novel_slots=best[3],
-        anchor_slots=best[4],
-        novel_fraction=best[2],
-    )
+    plans = []
+    for anchor_repeats in range(1, 33):
+        center = max(1, round(ratio * n_anchor * anchor_repeats / n_novel))
+        for novel_repeats in {max(1, center - 1), center, center + 1}:
+            ns, ans = n_novel * novel_repeats, n_anchor * anchor_repeats
+            fraction = ns / (ns + ans)
+            plans.append(
+                (abs(fraction - mu), ns + ans, novel_repeats, anchor_repeats, fraction)
+            )
+    close = [plan for plan in plans if plan[0] <= 0.015]
+    best = min(close, key=lambda plan: (plan[1], plan[0])) if close else min(plans)
+    return MixPlan(best[2], best[3], n_novel * best[2], n_anchor * best[3], best[4])
 
 
 def build_train_overrides(
@@ -145,20 +142,45 @@ def train_detection_head(
     mu: float = MU_NOVEL,
     yolo_factory=None,
     progress_callback=None,
+    replay_sources: list[tuple[Path, str]] | None = None,
 ) -> TrainResult:
     """Fine-tune a detection head. ``yolo_factory`` injects a fake for tests."""
     novel_root = Path(novel_dir)
     work = Path(project).resolve()
     work.mkdir(parents=True, exist_ok=True)
     if anchor_dir is None:
-        anchors = generate_anchor_set(work / "anchors", count=anchor_count)
+        anchors = Path.cwd() / "weights" / "anchors"
+        if not (anchors / "classes.txt").is_file():
+            raise ValueError(
+                "Real rehearsal images are missing. Run python -m tapyolo.setup, or pass --anchors with images/, labels/, classes.txt."
+            )
     else:
         anchors = Path(anchor_dir)
     anchor_names = _anchor_names(anchors)
-    names, novel_class_id = _class_list(class_name, anchor_names)
-    plan = plan_repetitions(_count_images(novel_root), _count_images(anchors), mu)
+    names = list(anchor_names)
+    for _, name in replay_sources or []:
+        if not any(existing.casefold() == name.casefold() for existing in names):
+            names.append(name)
+    names, novel_class_id = _class_list(class_name, names)
+    class_name = names[novel_class_id]
+    canonical_replay = [
+        (
+            root,
+            next(
+                existing for existing in names if existing.casefold() == name.casefold()
+            ),
+        )
+        for root, name in replay_sources or []
+    ]
     dataset = work / "dataset"
-    data_yaml = _materialize_mix(novel_root, anchors, dataset, names, novel_class_id, plan)
+    data_yaml, fraction = materialize_dataset(
+        [(novel_root, class_name), *canonical_replay],
+        anchors,
+        dataset,
+        names,
+        mu,
+        anchor_count=anchor_count,
+    )
     params = TrainHyperParams(epochs=epochs, mu_novel=mu)
     overrides = build_train_overrides(
         params,
@@ -168,6 +190,8 @@ def train_detection_head(
         imgsz=imgsz,
         batch=batch,
     )
+    overrides["nbs"] = batch
+    real_training = yolo_factory is None
     if yolo_factory is None:
         from ultralytics import YOLO
 
@@ -189,8 +213,15 @@ def train_detection_head(
 
     if hasattr(yolo, "add_callback"):
         yolo.add_callback("on_train_epoch_end", on_train_epoch_end)
-    yolo.train(**overrides)
-    save_dir = Path(getattr(getattr(yolo, "trainer", None), "save_dir", work / "train" / "head"))
+    if real_training:
+        from tapyolo.adaptation import adaptation_trainer
+
+        yolo.train(trainer=adaptation_trainer(), **overrides)
+    else:
+        yolo.train(**overrides)
+    save_dir = Path(
+        getattr(getattr(yolo, "trainer", None), "save_dir", work / "train" / "head")
+    )
     weights = _find_weights(save_dir)
     return TrainResult(
         data_yaml=str(data_yaml),
@@ -201,7 +232,7 @@ def train_detection_head(
         epochs=epochs,
         novel_class_id=novel_class_id,
         anchor_class_ids=list(range(len(anchor_names))),
-        mix_fraction=plan.novel_fraction,
+        mix_fraction=fraction,
         note=LOSS_MIX_NOTE,
     )
 
@@ -229,19 +260,8 @@ def train_labeled_class(
     novel_root = Path(novel_dir).resolve()
     work = Path(project).resolve()
     dataset = work / "labeled-data"
-    dataset.mkdir(parents=True, exist_ok=True)
-    data_yaml = dataset / "data.yaml"
-    data_yaml.write_text(
-        yaml.safe_dump(
-            {
-                "path": str(novel_root),
-                "train": "images",
-                "val": "images",
-                "names": {0: class_name},
-            },
-            sort_keys=False,
-        ),
-        encoding="utf-8",
+    data_yaml, _ = materialize_dataset(
+        [(novel_root, class_name)], None, dataset, [class_name], 1.0
     )
     safe_batch = max(1, int(batch))
     overrides = {
@@ -295,12 +315,14 @@ def train_labeled_class(
     if hasattr(yolo, "add_callback"):
         yolo.add_callback("on_train_epoch_end", on_train_epoch_end)
     yolo.train(**overrides)
-    save_dir = Path(getattr(getattr(yolo, "trainer", None), "save_dir", work / "train" / "head"))
+    save_dir = Path(
+        getattr(getattr(yolo, "trainer", None), "save_dir", work / "train" / "head")
+    )
     weights = _find_weights(save_dir)
     note = f"Trained {class_name} on the segmented object."
     return TrainResult(
         data_yaml=str(data_yaml),
-        dataset_root=str(novel_root),
+        dataset_root=str(dataset),
         save_dir=str(save_dir),
         weights=str(weights) if weights else None,
         device=device,
@@ -314,17 +336,25 @@ def train_labeled_class(
 
 def _anchor_names(anchor_root: Path) -> list[str]:
     path = anchor_root / "classes.txt"
-    if path.is_file():
-        names = [line.strip() for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
-        if names:
-            return names
-    return list(ANCHOR_NAMES)
+    if not path.is_file():
+        raise ValueError(
+            "Rehearsal images need classes.txt so class ids can be aligned correctly"
+        )
+    names = [
+        line.strip()
+        for line in path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    if not names or len({name.casefold() for name in names}) != len(names):
+        raise ValueError("classes.txt must contain distinct, non-empty class names")
+    return names
 
 
 def _class_list(class_name: str, anchor_names: list[str]) -> tuple[list[str], int]:
     names = list(anchor_names)
-    if class_name in names:
-        return names, names.index(class_name)
+    for index, name in enumerate(names):
+        if name.casefold() == class_name.casefold():
+            return names, index
     names.append(class_name)
     return names, len(names) - 1
 
@@ -343,41 +373,6 @@ def _pairs(root: Path) -> list[tuple[Path, Path]]:
             continue
         pairs.append((image, root / "labels" / f"{image.stem}.txt"))
     return pairs
-
-
-def _materialize_mix(
-    novel_root: Path,
-    anchor_root: Path,
-    dataset: Path,
-    names: list[str],
-    novel_class_id: int,
-    plan: MixPlan,
-) -> Path:
-    if dataset.exists():
-        shutil.rmtree(dataset)
-    image_dir = dataset / "images" / "train"
-    label_dir = dataset / "labels" / "train"
-    image_dir.mkdir(parents=True)
-    label_dir.mkdir(parents=True)
-    novel_pairs = _pairs(novel_root)
-    anchor_pairs = _pairs(anchor_root)
-    for repeat in range(plan.novel_repeats):
-        for image, label in novel_pairs:
-            stem = f"novel_{image.stem}_r{repeat}"
-            _copy_pair(image, label, image_dir, label_dir, stem, novel_class_id)
-    for repeat in range(plan.anchor_repeats):
-        for image, label in anchor_pairs:
-            stem = f"anchor_{image.stem}_r{repeat}"
-            _copy_pair(image, label, image_dir, label_dir, stem, None)
-    data_yaml = dataset / "data.yaml"
-    payload = {
-        "path": str(dataset),
-        "train": "images/train",
-        "val": "images/train",
-        "names": names,
-    }
-    data_yaml.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
-    return data_yaml
 
 
 def _copy_pair(
@@ -409,3 +404,133 @@ def _find_weights(save_dir: Path) -> Path | None:
         if found:
             return found[-1]
     return None
+
+
+def materialize_dataset(sources, anchors, dataset, names, mu, *, anchor_count=25):
+    """Keep every derivative of a source frame in one split; validate real originals only."""
+    if dataset.exists():
+        shutil.rmtree(dataset)
+    for split in ("train", "val"):
+        (dataset / "images" / split).mkdir(parents=True)
+        (dataset / "labels" / split).mkdir(parents=True)
+    novel_train = []
+    anchor_train = []
+    seen = set()
+    for source_index, (root, name) in enumerate(sources):
+        root = Path(root).resolve()
+        if (str(root), name) in seen:
+            continue
+        seen.add((str(root), name))
+        pairs = _pairs(root)
+        groups = {}
+        for image, label in pairs:
+            # Exported augmentations and object-removed negatives share their original's group.
+            group = re.sub(r"_(?:bg\d+|gone)$", "", image.stem)
+            groups.setdefault(group, []).append((image, label))
+        positives = [
+            g
+            for g, items in groups.items()
+            if any(lab.is_file() and lab.read_text().strip() for _, lab in items)
+        ]
+        if len(positives) < 2:
+            raise ValueError(
+                f"{name}: label at least two different keyframes for separate training and validation"
+            )
+        held = set(positives[::5])
+        if len(held) == len(positives):
+            held = {positives[-1]}
+        negative_groups = [g for g in groups if g not in positives]
+        held.update(negative_groups[::5])
+        for group, items in groups.items():
+            for image, label in items:
+                stem = f"novel_{source_index}_{image.stem}"
+                if group in held:
+                    if image.stem != group:  # never validate a synthetic view
+                        continue
+                    _copy_pair(
+                        image,
+                        label,
+                        dataset / "images/val",
+                        dataset / "labels/val",
+                        stem,
+                        names.index(name),
+                    )
+                else:
+                    novel_train.append((image, label, stem, names.index(name)))
+    if anchors is not None:
+        pairs = _pairs(Path(anchors))
+        if len(pairs) < 2:
+            raise ValueError("Rehearsal set needs at least two real images")
+        # Fixed, non-overlapping subset. Unused originals remain held out.
+        train_ids = set(
+            np_even_indices(len(pairs), min(anchor_count, max(1, len(pairs) * 4 // 5)))
+        )
+        for index, (image, label) in enumerate(pairs):
+            stem = f"anchor_{image.stem}"
+            if index in train_ids:
+                anchor_train.append((image, label, stem, None))
+            else:
+                _copy_pair(
+                    image,
+                    label,
+                    dataset / "images/val",
+                    dataset / "labels/val",
+                    stem,
+                    None,
+                )
+    plan = (
+        plan_repetitions(len(novel_train), len(anchor_train), mu)
+        if anchor_train
+        else None
+    )
+    repeats = plan.novel_repeats if plan else 1
+    for repeat in range(repeats):
+        for image, label, stem, class_id in novel_train:
+            _copy_pair(
+                image,
+                label,
+                dataset / "images/train",
+                dataset / "labels/train",
+                f"{stem}_r{repeat}",
+                class_id,
+            )
+    anchor_repeats = plan.anchor_repeats if plan else 0
+    for repeat in range(anchor_repeats):
+        for image, label, stem, class_id in anchor_train:
+            _copy_pair(
+                image,
+                label,
+                dataset / "images/train",
+                dataset / "labels/train",
+                f"{stem}_r{repeat}",
+                class_id,
+            )
+    data_yaml = dataset / "data.yaml"
+    data_yaml.write_text(
+        yaml.safe_dump(
+            {
+                "path": str(dataset.resolve()),
+                "train": "images/train",
+                "val": "images/val",
+                "names": names,
+            },
+            sort_keys=False,
+        )
+    )
+    (dataset / "sources.json").write_text(
+        json.dumps(
+            [
+                {"root": str(Path(root).resolve()), "name": name}
+                for root, name in sources
+            ],
+            indent=2,
+        )
+    )
+    count = len(novel_train) * repeats
+    return data_yaml, count / (count + len(anchor_train) * anchor_repeats)
+
+
+def np_even_indices(length, count):
+    from tapyolo.sampler import evenly_spaced
+
+    return evenly_spaced(list(range(length)), count)

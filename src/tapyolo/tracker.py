@@ -90,6 +90,10 @@ def _track_direction(
             else:
                 chosen, score = predicted, 0.0
         chosen = _validate_box(chosen, width, height)
+        if score <= 0:
+            # An extrapolated location is not a detection. Stop at occlusion
+            # rather than creating confident-looking labels on empty scenes.
+            break
         new_cx, new_cy = _center(chosen)
         if score > 0:
             vx = new_cx - cx

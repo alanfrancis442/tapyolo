@@ -1241,7 +1241,7 @@ requires-dist = [
     { name = "supervision", specifier = ">=0.23.0" },
     { name = "torch", specifier = ">=2.4.0", index = "https://download.pytorch.org/whl/cu124" },
     { name = "torchvision", specifier = ">=0.19.0", index = "https://download.pytorch.org/whl/cu124" },
-    { name = "ultralytics", specifier = ">=8.3.0" },
+    { name = "ultralytics", specifier = ">=8.4.173" },
 ]
 provides-extras = ["dev"]
 

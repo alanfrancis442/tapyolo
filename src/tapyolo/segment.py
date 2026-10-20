@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import hashlib
 import os
+import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,7 +45,72 @@ class FallbackSegmenter:
         wide = _flood(frame, sx, sy, tolerance=64)
         if _usable(wide):
             return wide, "flood"
-        return _window_mask(height, width, sx, sy, half=16), "box"
+        raise ValueError(
+            "Could not isolate the object. Add a foreground/background point or draw a correction box."
+        )
+
+    def segment_prompt(self, image, points, labels):
+        positives = [point for point, label in zip(points, labels) if label == 1]
+        mask = np.zeros(image.shape[:2], np.uint8)
+        for x, y in positives:
+            candidate, _ = self.segment(image, x, y)
+            mask |= candidate
+        for (x, y), label in zip(points, labels):
+            if label == 0 and mask[y, x]:
+                mask[_component_at(mask, x, y) > 0] = 0
+        return validate_prompt_mask(
+            mask, points, labels
+        ), "OpenCV fallback; review the selection"
+
+
+class MobileSamSegmenter:
+    """Learned point prompts with one cached image embedding for refinement."""
+
+    name = "mobilesam"
+
+    def __init__(self, weights: Path, device: str = "cpu") -> None:
+        from ultralytics.models.sam import Predictor
+
+        self.predictor = Predictor(
+            overrides={
+                "model": str(weights),
+                "device": device,
+                "imgsz": 1024,
+                "verbose": False,
+                "save": False,
+            }
+        )
+        self._key = None
+        self._lock = threading.Lock()
+
+    def segment(self, image, x, y):
+        return self.segment_prompt(image, [[x, y]], [1])
+
+    def segment_prompt(self, image, points, labels):
+        import torch
+
+        key = (image.shape, hashlib.blake2b(image.tobytes(), digest_size=16).digest())
+        with self._lock, torch.inference_mode():
+            if key != self._key:
+                self.predictor.reset_image()
+                self.predictor.set_image(image)
+                self._key = key
+            results = self.predictor(
+                source=image,
+                points=[points],
+                labels=[labels],
+                multimask_output=True,
+            )
+            result = results[0]
+            if result.masks is None:
+                raise ValueError(
+                    "MobileSAM returned no object; refine the points or draw a box"
+                )
+            masks = result.masks.data.cpu().numpy()
+            scores = result.boxes.conf.cpu().numpy()
+            return choose_prompt_mask(
+                masks, scores, points, labels
+            ), "MobileSAM with point refinement"
 
 
 class OnnxMobileSamSegmenter:
@@ -62,24 +129,38 @@ class OnnxMobileSamSegmenter:
         options = ort.SessionOptions()
         options.log_severity_level = 3
         providers = _providers(ort)
-        self.encoder = ort.InferenceSession(str(encoder_path), sess_options=options, providers=providers)
-        self.decoder = ort.InferenceSession(str(decoder_path), sess_options=options, providers=providers)
+        self.encoder = ort.InferenceSession(
+            str(encoder_path), sess_options=options, providers=providers
+        )
+        self.decoder = ort.InferenceSession(
+            str(decoder_path), sess_options=options, providers=providers
+        )
         self.encoder_path = encoder_path
         self.decoder_path = decoder_path
+        self._embedding_key = None
+        self._embedding = None
 
     def segment(self, image: np.ndarray, x: int, y: int) -> tuple[np.ndarray, str]:
+        return self.segment_prompt(image, [[x, y]], [1])
+
+    def segment_prompt(self, image, points, labels):
         cv2 = _cv2()
         frame = image
         if frame.ndim == 2:
             frame = cv2.cvtColor(frame, cv2.COLOR_GRAY2BGR)
         height, width = frame.shape[:2]
-        sx, sy = _clip_point(x, y, width, height)
         input_size = _spatial_size(self.encoder)
         tensor, scale = prepare_encoder_input(frame, input_size)
         enc_input = self.encoder.get_inputs()[0]
-        embedding = self.encoder.run(None, {enc_input.name: tensor})[0]
-        point = np.array([[[sx * scale, sy * scale]]], dtype=np.float32)
-        labels = np.array([[1]], dtype=np.float32)
+        key = (frame.shape, hashlib.blake2b(frame.tobytes(), digest_size=16).digest())
+        if key != self._embedding_key:
+            self._embedding = self.encoder.run(None, {enc_input.name: tensor})[0]
+            self._embedding_key = key
+        embedding = self._embedding
+        point = np.array(
+            [[*[[x * scale, y * scale] for x, y in points], [0, 0]]], dtype=np.float32
+        )
+        labels_tensor = np.array([[*labels, -1]], dtype=np.float32)
         mask_input = np.zeros((1, 1, 256, 256), dtype=np.float32)
         has_mask = np.zeros((1,), dtype=np.float32)
         orig = np.array([height, width], dtype=np.float32)
@@ -87,19 +168,27 @@ class OnnxMobileSamSegmenter:
             self.decoder,
             embedding=embedding,
             point_coords=point,
-            point_labels=labels,
+            point_labels=labels_tensor,
             mask_input=mask_input,
             has_mask_input=has_mask,
             orig_im_size=orig,
         )
         outputs = self.decoder.run(None, feed)
-        mask = postprocess_sam_mask(outputs[0], outputs[1] if len(outputs) > 1 else None, (height, width))
+        raw = np.asarray(outputs[0]).reshape(-1, *outputs[0].shape[-2:])
+        candidates = [
+            postprocess_sam_mask(item, None, (height, width), input_size)
+            for item in raw
+        ]
+        scores = (
+            outputs[1].reshape(-1) if len(outputs) > 1 else np.ones(len(candidates))
+        )
+        mask = choose_prompt_mask(candidates, scores, points, labels)
         return mask, "onnx"
 
 
 @dataclass
 class SegmenterChoice:
-    segmenter: FallbackSegmenter | OnnxMobileSamSegmenter
+    segmenter: FallbackSegmenter | OnnxMobileSamSegmenter | MobileSamSegmenter
     onnx_error: str | None = None
 
     @property
@@ -117,20 +206,25 @@ class SegmentOutput:
     detail: str
 
 
-def prepare_encoder_input(image: np.ndarray, input_size: int = SAM_INPUT) -> tuple[np.ndarray, float]:
+def prepare_encoder_input(
+    image: np.ndarray, input_size: int = SAM_INPUT
+) -> tuple[np.ndarray, float]:
     """RGB, longest-side resize, pad to square, SAM mean/std. Returns NCHW and the scale."""
     cv2 = _cv2()
-    rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB) if image.ndim == 3 else cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    rgb = (
+        cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        if image.ndim == 3
+        else cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
+    )
     height, width = rgb.shape[:2]
     scale = float(input_size) / float(max(height, width))
     resized_w = max(1, int(round(width * scale)))
     resized_h = max(1, int(round(height * scale)))
     resized = cv2.resize(rgb, (resized_w, resized_h), interpolation=cv2.INTER_LINEAR)
     canvas = np.zeros((input_size, input_size, 3), dtype=np.float32)
-    canvas[:resized_h, :resized_w] = resized.astype(np.float32)
     mean = np.array([123.675, 116.28, 103.53], dtype=np.float32)
     std = np.array([58.395, 57.12, 57.375], dtype=np.float32)
-    canvas = (canvas - mean) / std
+    canvas[:resized_h, :resized_w] = (resized.astype(np.float32) - mean) / std
     tensor = np.transpose(canvas, (2, 0, 1))[None].astype(np.float32)
     return tensor, scale
 
@@ -143,6 +237,7 @@ def postprocess_sam_mask(
     masks: np.ndarray,
     ious: np.ndarray | None,
     original_hw: tuple[int, int],
+    input_size: int = SAM_INPUT,
 ) -> np.ndarray:
     arr = np.asarray(masks)
     if arr.ndim == 4:
@@ -156,12 +251,40 @@ def postprocess_sam_mask(
         arr = arr[min(index, arr.shape[0] - 1)]
     if arr.ndim != 2:
         raise ValueError(f"unexpected mask rank {masks.shape}")
-    binary = (arr > 0.0).astype(np.uint8)
     height, width = original_hw
-    if binary.shape != (height, width):
+    if arr.shape != (height, width):
         cv2 = _cv2()
-        binary = cv2.resize(binary, (width, height), interpolation=cv2.INTER_NEAREST)
-    return (binary > 0).astype(np.uint8)
+        # Low-resolution decoder logits include the square encoder's padding.
+        arr = cv2.resize(arr.astype(np.float32), (input_size, input_size))
+        scale = input_size / max(height, width)
+        arr = arr[: max(1, round(height * scale)), : max(1, round(width * scale))]
+        arr = cv2.resize(arr, (width, height))
+    return (arr > 0).astype(np.uint8)
+
+
+def validate_prompt_mask(mask, points, labels):
+    binary = (np.asarray(mask) > 0).astype(np.uint8)
+    if binary.sum() < 9 or binary.mean() > 0.85:
+        raise ValueError(
+            "Selection is empty or covers most of the scene. Refine the points or draw a box."
+        )
+    for (x, y), label in zip(points, labels):
+        if bool(binary[y, x]) != bool(label):
+            raise ValueError(
+                "Selection does not match the points. Refine the points or draw a box."
+            )
+    return binary
+
+
+def choose_prompt_mask(masks, scores, points, labels):
+    for index in np.argsort(np.asarray(scores).reshape(-1))[::-1]:
+        try:
+            return validate_prompt_mask(masks[index], points, labels)
+        except ValueError:
+            continue
+    raise ValueError(
+        "No plausible mask matches the points. Add correction points or draw a box."
+    )
 
 
 def find_onnx_weights(roots: list[Path] | None = None) -> tuple[Path, Path] | None:
@@ -189,12 +312,31 @@ def default_weight_roots() -> list[Path]:
     ]
 
 
-def load_segmenter(roots: list[Path] | None = None) -> SegmenterChoice:
+def load_segmenter(
+    roots: list[Path] | None = None, device: str = "cpu"
+) -> SegmenterChoice:
     found = find_onnx_weights(roots)
     if found is None:
+        native = os.environ.get("TAPYOLO_MOBILESAM_WEIGHTS")
+        candidates = (
+            [Path(native)]
+            if native
+            else [root / "mobile_sam.pt" for root in (roots or default_weight_roots())]
+        )
+        for path in candidates:
+            if path.is_file():
+                try:
+                    return SegmenterChoice(
+                        MobileSamSegmenter(path, device),
+                        onnx_error="ONNX pair not installed; using PyTorch MobileSAM",
+                    )
+                except Exception as exc:
+                    return SegmenterChoice(FallbackSegmenter(), onnx_error=str(exc))
         return SegmenterChoice(FallbackSegmenter(), onnx_error="weights not found")
     try:
-        return SegmenterChoice(OnnxMobileSamSegmenter(found[0], found[1]), onnx_error=None)
+        return SegmenterChoice(
+            OnnxMobileSamSegmenter(found[0], found[1]), onnx_error=None
+        )
     except Exception as exc:
         return SegmenterChoice(FallbackSegmenter(), onnx_error=str(exc))
 
@@ -217,7 +359,9 @@ def segment_box(image: np.ndarray, box: tuple[int, int, int, int]) -> np.ndarray
     roi = frame[y1 : y2 + 1, x1 : x2 + 1]
     grab = _mask_grabcut(roi)
     cluster = _mask_cluster(roi)
-    chosen = grab if _mask_quality(roi, grab) >= _mask_quality(roi, cluster) else cluster
+    chosen = (
+        grab if _mask_quality(roi, grab) >= _mask_quality(roi, cluster) else cluster
+    )
     chosen = _grow_into_object(roi, chosen)
     box_area = roi.shape[0] * roi.shape[1]
     if int(chosen.sum()) < max(16, int(0.02 * box_area)):
@@ -328,7 +472,9 @@ def cutout_views(
         nw = max(4, int(round(sprite.shape[1] * scale)))
         max_left = max(0, width - nw)
         max_top = max(0, height - nh)
-        place(scale, int(rng.integers(0, max_left + 1)), int(rng.integers(0, max_top + 1)))
+        place(
+            scale, int(rng.integers(0, max_left + 1)), int(rng.integers(0, max_top + 1))
+        )
     return views
 
 
@@ -338,17 +484,12 @@ def segment_point(
     y: int,
     segmenter: FallbackSegmenter | OnnxMobileSamSegmenter,
 ) -> SegmentOutput:
-    """Time the successful segmenter call. A failed ONNX call is not reported as ONNX latency."""
+    """Time a validated selection; learned-model failures require user correction."""
     started = time.perf_counter()
-    try:
-        mask, detail = segmenter.segment(image, x, y)
-        backend = segmenter.name
-    except Exception:
-        if segmenter.name == "fallback":
-            raise
-        started = time.perf_counter()
-        mask, detail = FallbackSegmenter().segment(image, x, y)
-        backend = "fallback"
+    mask, detail = segmenter.segment(image, x, y)
+    x, y = _clip_point(x, y, image.shape[1], image.shape[0])
+    mask = validate_prompt_mask(mask, [[x, y]], [1])
+    backend = segmenter.name
     elapsed_ms = (time.perf_counter() - started) * 1000.0
     bbox = mask_to_bbox(mask)
     height, width = image.shape[:2]
@@ -366,8 +507,12 @@ def _clip_box(
     height: int,
 ) -> tuple[int, int, int, int]:
     x1, y1, x2, y2 = (int(value) for value in box)
-    left, right = sorted((_clip_point(x1, 0, width, height)[0], _clip_point(x2, 0, width, height)[0]))
-    top, bottom = sorted((_clip_point(0, y1, width, height)[1], _clip_point(0, y2, width, height)[1]))
+    left, right = sorted(
+        (_clip_point(x1, 0, width, height)[0], _clip_point(x2, 0, width, height)[0])
+    )
+    top, bottom = sorted(
+        (_clip_point(0, y1, width, height)[1], _clip_point(0, y2, width, height)[1])
+    )
     return left, top, right, bottom
 
 
@@ -380,7 +525,10 @@ def _downscale(roi: np.ndarray) -> tuple[np.ndarray, tuple[int, int]]:
     resized_h = max(8, int(round(height * scale)))
     if (resized_w, resized_h) == (width, height):
         return roi, (width, height)
-    return cv2.resize(roi, (resized_w, resized_h), interpolation=cv2.INTER_AREA), (width, height)
+    return cv2.resize(roi, (resized_w, resized_h), interpolation=cv2.INTER_AREA), (
+        width,
+        height,
+    )
 
 
 def _edge_band(height: int, width: int) -> np.ndarray:
@@ -401,7 +549,9 @@ def _skin_mask(image: np.ndarray) -> np.ndarray:
     hue, sat, value = hsv[:, :, 0], hsv[:, :, 1], hsv[:, :, 2]
     cr, cb = ycrcb[:, :, 1], ycrcb[:, :, 2]
     reddish = (hue <= 35) | (hue >= 165)
-    classic = (cr >= 133) & (cr <= 173) & (cb >= 77) & (cb <= 127) & (sat >= 28) & reddish
+    classic = (
+        (cr >= 133) & (cr <= 173) & (cb >= 77) & (cb <= 127) & (sat >= 28) & reddish
+    )
     dark = reddish & (sat >= 30) & (value <= 110) & (sat <= 160)
     vivid = sat >= 140
     return (classic | dark) & (~vivid)
@@ -458,8 +608,12 @@ def _mask_grabcut(roi: np.ndarray) -> np.ndarray:
     background = np.zeros((1, 65), np.float64)
     foreground = np.zeros((1, 65), np.float64)
     try:
-        cv2.grabCut(small, labels, None, background, foreground, 3, cv2.GC_INIT_WITH_MASK)
-        binary = np.where((labels == cv2.GC_FGD) | (labels == cv2.GC_PR_FGD), 1, 0).astype(np.uint8)
+        cv2.grabCut(
+            small, labels, None, background, foreground, 3, cv2.GC_INIT_WITH_MASK
+        )
+        binary = np.where(
+            (labels == cv2.GC_FGD) | (labels == cv2.GC_PR_FGD), 1, 0
+        ).astype(np.uint8)
     except cv2.error:
         binary = colorful.astype(np.uint8)
     binary[skin] = 0
@@ -488,7 +642,9 @@ def _mask_cluster(roi: np.ndarray) -> np.ndarray:
         samples = lab[ys, xs].reshape(-1, 3)
         clusters = 2 if len(xs) >= 80 else 1
         criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 0.8)
-        _, packed, _ = cv2.kmeans(samples, clusters, None, criteria, 3, cv2.KMEANS_PP_CENTERS)
+        _, packed, _ = cv2.kmeans(
+            samples, clusters, None, criteria, 3, cv2.KMEANS_PP_CENTERS
+        )
         label_map = np.zeros((height, width), np.int32)
         label_map[ys, xs] = packed.ravel() + 1
 
@@ -500,7 +656,10 @@ def _mask_cluster(roi: np.ndarray) -> np.ndarray:
             saturation = float(hsv[:, :, 1][selected].mean())
             touch = float((selected & (border > 0)).sum()) / area
             yy, xx = np.nonzero(selected)
-            spread = float(np.sqrt(((yy - yy.mean()) ** 2 + (xx - xx.mean()) ** 2).mean()) / max(np.sqrt(area), 1))
+            spread = float(
+                np.sqrt(((yy - yy.mean()) ** 2 + (xx - xx.mean()) ** 2).mean())
+                / max(np.sqrt(area), 1)
+            )
             return saturation - 140 * touch - 20 * spread
 
         best = max(range(1, clusters + 1), key=score)
@@ -509,7 +668,9 @@ def _mask_cluster(roi: np.ndarray) -> np.ndarray:
         foreground = candidate.astype(np.uint8)
     radius = max(2, int(round(0.4 * np.sqrt(max(int(foreground.sum()), 1)))))
     radius = min(radius, max(2, min(height, width) // 6))
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1)
+    )
     grown = cv2.dilate(foreground, kernel)
     grown[skin] = 0
     if int(foreground.sum()):
@@ -517,7 +678,9 @@ def _mask_cluster(roi: np.ndarray) -> np.ndarray:
         near = np.linalg.norm(lab - seed, axis=2) < 38
         grown = ((grown > 0) & (near | (foreground > 0))).astype(np.uint8)
     grown = _keep_component(grown, foreground)
-    grown = cv2.morphologyEx(grown, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)))
+    grown = cv2.morphologyEx(
+        grown, cv2.MORPH_CLOSE, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    )
     grown = _fill_holes(grown)
     grown[skin] = 0
     return cv2.resize(grown, size, interpolation=cv2.INTER_NEAREST)
@@ -547,7 +710,9 @@ def _grow_into_object(roi: np.ndarray, mask: np.ndarray) -> np.ndarray:
     seed = np.median(lab[binary > 0].reshape(-1, 3), axis=0)
     radius = max(2, int(round(0.28 * np.sqrt(float(binary.sum())))))
     radius = min(radius, max(2, min(roi.shape[:2]) // 8))
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1))
+    kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (radius * 2 + 1, radius * 2 + 1)
+    )
     grown = cv2.dilate(binary, kernel)
     near = np.linalg.norm(lab - seed, axis=2) < 42
     grown = ((grown > 0) & (near | (binary > 0)) & (~skin)).astype(np.uint8)
@@ -586,12 +751,20 @@ def _composite(
     if float(part.max()) < 0.2:
         return None
     region = canvas[y1:y2, x1:x2].astype(np.float32)
-    blended = part[:, :, None] * sprite[sy1:sy2, sx1:sx2].astype(np.float32) + (1.0 - part[:, :, None]) * region
+    blended = (
+        part[:, :, None] * sprite[sy1:sy2, sx1:sx2].astype(np.float32)
+        + (1.0 - part[:, :, None]) * region
+    )
     canvas[y1:y2, x1:x2] = blended.astype(np.uint8)
     ys, xs = np.nonzero(part > 0.35)
     if xs.size == 0:
         return None
-    return x1 + int(xs.min()), y1 + int(ys.min()), x1 + int(xs.max()), y1 + int(ys.max())
+    return (
+        x1 + int(xs.min()),
+        y1 + int(ys.min()),
+        x1 + int(xs.max()),
+        y1 + int(ys.max()),
+    )
 
 
 def _usable(mask: np.ndarray) -> bool:
@@ -626,8 +799,12 @@ def _grabcut(image: np.ndarray, x: int, y: int) -> np.ndarray:
     mask = np.zeros((height, width), np.uint8)
     bgd = np.zeros((1, 65), np.float64)
     fgd = np.zeros((1, 65), np.float64)
-    cv2.grabCut(image.copy(), mask, (x0, y0, rect_w, rect_h), bgd, fgd, 3, cv2.GC_INIT_WITH_RECT)
-    binary = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 1, 0).astype(np.uint8)
+    cv2.grabCut(
+        image.copy(), mask, (x0, y0, rect_w, rect_h), bgd, fgd, 3, cv2.GC_INIT_WITH_RECT
+    )
+    binary = np.where((mask == cv2.GC_FGD) | (mask == cv2.GC_PR_FGD), 1, 0).astype(
+        np.uint8
+    )
     return _component_at(binary, x, y)
 
 

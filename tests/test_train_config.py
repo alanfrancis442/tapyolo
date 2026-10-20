@@ -52,7 +52,11 @@ def test_anchor_set_has_25_multiclass_images(tmp_path):
     assert len(images) == ANCHOR_COUNT
     multi = 0
     for image in images:
-        lines = (root / "labels" / f"{image.stem}.txt").read_text(encoding="utf-8").splitlines()
+        lines = (
+            (root / "labels" / f"{image.stem}.txt")
+            .read_text(encoding="utf-8")
+            .splitlines()
+        )
         assert lines
         if len(lines) >= 2:
             multi += 1
@@ -65,7 +69,11 @@ def test_train_function_accepts_a_tiny_epoch_budget(tmp_path):
     (novel / "images").mkdir(parents=True)
     (novel / "labels").mkdir()
     (novel / "images" / "key_000.jpg").write_bytes(b"not-a-real-jpeg-but-copied")
-    (novel / "labels" / "key_000.txt").write_text("0 0.500000 0.500000 0.200000 0.200000\n", encoding="utf-8")
+    (novel / "labels" / "key_000.txt").write_text(
+        "0 0.500000 0.500000 0.200000 0.200000\n", encoding="utf-8"
+    )
+    (novel / "images" / "key_001.jpg").write_bytes(b"jpeg")
+    (novel / "labels" / "key_001.txt").write_text("0 0.5 0.5 0.2 0.2\n")
     captured: dict = {}
 
     class FakeYOLO:
@@ -89,6 +97,7 @@ def test_train_function_accepts_a_tiny_epoch_budget(tmp_path):
         imgsz=64,
         batch=2,
         yolo_factory=FakeYOLO,
+        anchor_dir=generate_anchor_set(tmp_path / "anchors"),
     )
     assert captured["model"] == "yolo11n.pt"
     assert "on_train_epoch_end" in captured["callbacks"]
@@ -112,7 +121,9 @@ def test_train_function_accepts_a_tiny_epoch_budget(tmp_path):
     assert abs(fraction - 0.70) < 0.05
     assert result.mix_fraction == fraction
     assert "0.70" in LOSS_MIX_NOTE
-    sample = next((tmp_path / "run" / "dataset" / "labels" / "train").glob("novel_*.txt"))
+    sample = next(
+        (tmp_path / "run" / "dataset" / "labels" / "train").glob("novel_*.txt")
+    )
     assert sample.read_text(encoding="utf-8").startswith("5 ")
 
 
@@ -121,7 +132,11 @@ def test_labeled_class_keeps_the_learning_rate(tmp_path):
     (novel / "images").mkdir(parents=True)
     (novel / "labels").mkdir()
     (novel / "images" / "key_000.jpg").write_bytes(b"jpeg")
-    (novel / "labels" / "key_000.txt").write_text("0 0.500000 0.500000 0.200000 0.200000\n", encoding="utf-8")
+    (novel / "labels" / "key_000.txt").write_text(
+        "0 0.500000 0.500000 0.200000 0.200000\n", encoding="utf-8"
+    )
+    (novel / "images" / "key_001.jpg").write_bytes(b"jpeg")
+    (novel / "labels" / "key_001.txt").write_text("0 0.5 0.5 0.2 0.2\n")
     captured: dict = {}
 
     class FakeYOLO:
@@ -159,7 +174,8 @@ def test_labeled_class_keeps_the_learning_rate(tmp_path):
     data = Path(kwargs["data"]).read_text(encoding="utf-8")
     assert "ameen" in data
     assert "person" not in data
-    assert str(novel.resolve()) in data
+    assert "images/val" in data
+    assert "images/train" in data
     assert result.novel_class_id == 0
     assert result.mix_fraction == 1.0
     assert result.weights is None

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import threading
+import time
 import uuid
 import zlib
 from dataclasses import dataclass, field
@@ -13,12 +14,20 @@ from urllib.parse import urlparse
 
 import numpy as np
 
-from tapyolo.bbox import xyxy_to_yolo
+from tapyolo.bbox import mask_to_bbox, xyxy_to_yolo
 from tapyolo.capture import SavedCapture, decode_upload, process_frames, save_capture
 from tapyolo.device import resolve_device
 from tapyolo.labels import clean_label, write_empty_label, write_yolo_label
-from tapyolo.segment import SegmenterChoice, load_segmenter, object_mask, scene_without_object, training_views
-from tapyolo.train import LABELED_EPOCHS, train_labeled_class
+from tapyolo.models import catalog, replay_sources
+from tapyolo.segment import (
+    SegmenterChoice,
+    load_segmenter,
+    scene_without_object,
+    training_views,
+)
+from tapyolo.tracker import propagate_bidirectional
+from tapyolo.train import train_detection_head
+from tapyolo.video_tracker import load_video_tracker
 
 MAX_UPLOAD_BYTES = 80 * 1024 * 1024
 
@@ -44,7 +53,7 @@ INDEX_HTML = r"""<!DOCTYPE html>
   #view { position: relative; width: min(960px, 100%); min-height: 360px; background: #0c0e12; }
   #preview { display: none; width: 100%; max-height: 70vh; background: #000; object-fit: contain; }
   #preview.on { display: block; min-height: 360px; }
-  #stage { display: none; width: 100%; height: auto; background: #0c0e12; cursor: crosshair; }
+  #stage { touch-action: none; display: none; width: 100%; height: auto; background: #0c0e12; cursor: crosshair; }
   #stage.on { display: block; }
   #overlay { display: none; position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; }
   #overlay.on { display: block; }
@@ -79,18 +88,32 @@ INDEX_HTML = r"""<!DOCTYPE html>
     <video id="preview" autoplay playsinline muted></video>
     <canvas id="stage" class="on" width="640" height="360"></canvas>
     <canvas id="overlay"></canvas>
-    <p id="tapHint">Drag a box around the object. Green is the part training keeps.</p>
+    <p id="tapHint">Tap the object once. Refine with foreground/background points, or draw a correction box.</p>
   </div>
   <input id="scrub" type="range" min="0" max="0" value="0" disabled>
-  <p id="meta">Record a clip. Drag a box around the object on each orientation. Green marks the segmented object, and training leaves the background out.</p>
+  <p id="meta">Record a clip, then tap the object to label its keyframes. Review the boxes before training. Remove the object for the final second if you want background samples.</p>
 </main>
 <footer>
+  <label>Selection <select id="selectionMode">
+    <option value="tap">Tap object (new selection)</option>
+    <option value="add">Add foreground point</option>
+    <option value="remove">Exclude background point</option>
+    <option value="box">Draw correction box</option>
+  </select></label>
+  <button id="propagate" type="button" disabled>Propagate this correction</button>
+  <label><input id="backgroundTail" type="checkbox">The object is absent during the final second</label>
   <label>Label <input id="label" placeholder="Drill Machine"></label>
   <button id="clearBox" type="button" disabled>Clear this frame</button>
   <button id="train" type="button" disabled>Train Now</button>
   <div class="bar"><div id="fill"></div></div>
   <p id="progress">Idle</p>
 </footer>
+<section>
+  <label>Saved models <select id="savedModels"></select></label>
+  <button id="useModel" type="button">Use selected model</button>
+  <button id="deleteModel" type="button" disabled>Delete selected trained model</button>
+  <p>Deleting a model removes its checkpoints. Captures and labels are kept.</p>
+</section>
 <section id="live">
   <h2>Live</h2>
   <p id="liveStats"></p>
@@ -139,6 +162,48 @@ let liveOn = false;
 let viewMode = "train";
 let serverPreview = false;
 let openingCamera = null;
+const selectionMode = document.getElementById("selectionMode");
+const propagateBtn = document.getElementById("propagate");
+const savedModels = document.getElementById("savedModels");
+const deleteModelBtn = document.getElementById("deleteModel");
+const useModelBtn = document.getElementById("useModel");
+let pointsByFrame = {};
+let availableMasks = new Set();
+let annotationBusy = false;
+let training = false;
+let annotationPoll = null;
+
+function startAnnotationProgress() {
+  if (annotationPoll) clearInterval(annotationPoll);
+  const id = session.id;
+  annotationPoll = setInterval(async () => {
+    try {
+      const res = await fetch("/api/sessions/" + id + "/annotation-progress");
+      const data = await res.json();
+      if (annotationBusy && session.id === id && data.status === "running") {
+        meta.textContent = data.total ? "Following the object through the video: " + data.done + "/" + data.total + " frames…" : "Preparing video tracking…";
+      }
+    } catch (err) { /* The primary request reports any tracking error. */ }
+  }, 700);
+}
+
+function stopAnnotationProgress() {
+  if (annotationPoll) clearInterval(annotationPoll);
+  annotationPoll = null;
+}
+
+
+function updateBusyControls() {
+  recordBtn.disabled = annotationBusy || training;
+  fileInput.disabled = annotationBusy || training;
+  clearBtn.disabled = annotationBusy || training || !boxes[Number(scrub.value)];
+  selectionMode.disabled = annotationBusy || training;
+  modeTrain.disabled = annotationBusy || training;
+  modeInfer.disabled = annotationBusy || training;
+  resetModelBtn.disabled = annotationBusy || training || !resetModelBtn.dataset.canReset;
+}
+
+let modelCatalog = [];
 const recorder = { running: false, frames: [], last: 0, started: 0, stream: null };
 
 function fmt(seconds) {
@@ -161,7 +226,8 @@ async function postJSON(url, payload) {
 }
 
 fetch("/api/health").then((r) => r.json()).then((data) => {
-  healthEl.textContent = "Device " + data.device + " (requested " + data.device_requested + "); segmenter " + data.segmenter;
+  healthEl.textContent = "Device " + data.device + "; segmenter " + data.segmenter + "; tracker " + data.tracker;
+  if (!data.learned_segmentation) meta.textContent = "MobileSAM weights are unavailable; the OpenCV fallback is less reliable. Draw a box if needed. " + (data.segmenter_note || "");
 }).catch((err) => showError(err.message));
 
 openCamera("").catch((err) => {
@@ -179,6 +245,33 @@ resetModelBtn.addEventListener("click", () => {
   }).catch((err) => showError(err.message));
 });
 
+savedModels.addEventListener("change", () => {
+  deleteModelBtn.disabled = training || savedModels.value === "base";
+});
+useModelBtn.addEventListener("click", async () => {
+  try { applyModelStatus(await postJSON("/api/model/select", { id: savedModels.value })); }
+  catch (err) { showError(err.message); }
+});
+deleteModelBtn.addEventListener("click", async () => {
+  const model = modelCatalog.find((item) => item.id === savedModels.value);
+  if (!model || !confirm("Delete " + model.name + " and its checkpoint files? Captures and labels will be kept.")) return;
+  try { applyModelStatus(await postJSON("/api/model/delete", { id: model.id })); }
+  catch (err) { showError(err.message); }
+});
+propagateBtn.addEventListener("click", async () => {
+  if (!session || annotationBusy || training) return;
+  annotationBusy = true;
+  scrub.disabled = true;
+  updateBusyControls();
+  try {
+    const index = Number(scrub.value);
+    startAnnotationProgress();
+    const data = await postJSON("/api/sessions/" + session.id + "/propagate", { index });
+    applyAnnotation(data, index);
+  } catch (err) { showError(err.message); }
+  finally { stopAnnotationProgress(); annotationBusy = false; scrub.disabled = false; updateBusyControls(); describeFrame(); }
+});
+
 recordBtn.addEventListener("click", async () => {
   clearError();
   try {
@@ -190,7 +283,7 @@ recordBtn.addEventListener("click", async () => {
       await postJSON("/api/record/start", {});
       mode = "server";
       serverPreview = true;
-      meta.textContent = "Recording. At 8 seconds the picture freezes so you can draw a box.";
+      meta.textContent = "Recording. At 8 seconds the picture freezes so you can tap the object.";
       showStage();
       pollServerPreview();
       beginClock();
@@ -306,7 +399,7 @@ async function openCameraNow(deviceId) {
   }
   const chosen = stream.getVideoTracks()[0].getSettings().deviceId || deviceId || "";
   await refreshCameras(chosen);
-  meta.textContent = "Camera live. Press Record, then drag a box around the object on each orientation.";
+  meta.textContent = "Camera live. Press Record, then tap the object on a keyframe.";
   preview.scrollIntoView({ block: "nearest" });
 }
 
@@ -322,7 +415,7 @@ async function startBrowserRecord() {
   }
   showCamera();
   tapHint.classList.remove("on");
-  meta.textContent = "Recording. At 8 seconds the picture freezes so you can draw a box.";
+  meta.textContent = "Recording. At 8 seconds the picture freezes so you can tap the object.";
   recorder.frames = [];
   recorder.running = true;
   recorder.started = performance.now();
@@ -379,7 +472,7 @@ async function stopRecord() {
   stopBtn.disabled = true;
   serverPreview = false;
   if (mode !== "server") freezePreviewOntoStage();
-  meta.textContent = "Clip captured. Preparing frames so you can draw boxes.";
+  meta.textContent = "Clip captured. Preparing frames so you can tap the object.";
   if (mode === "server") {
     if (clock) clearInterval(clock);
     dot.classList.remove("on");
@@ -463,6 +556,8 @@ function showSession(data) {
   showStage();
   session = data;
   boxes = new Array(data.keyframe_count).fill(null);
+  pointsByFrame = {};
+  availableMasks = new Set();
   masks = new Array(data.keyframe_count).fill(null);
   maskTokens = new Array(data.keyframe_count).fill("");
   frameImage = null;
@@ -470,7 +565,7 @@ function showSession(data) {
   scrub.disabled = data.keyframe_count === 0;
   scrub.max = Math.max(0, data.keyframe_count - 1);
   scrub.value = "0";
-  tapHint.textContent = "Drag a box around the object. Green is the part training keeps.";
+  tapHint.textContent = "Tap the object once. Refine with foreground/background points, or draw a correction box.";
   tapHint.classList.add("on");
   describeFrame();
   if (data.warning) meta.textContent += " " + data.warning;
@@ -484,11 +579,12 @@ function describeFrame() {
   const index = Number(scrub.value);
   const labeled = boxes.filter(Boolean).length;
   const here = boxes[index]
-    ? "Green marks the object. Training leaves the rest of this frame out."
-    : "Drag a rectangle around the object on this frame.";
-  meta.textContent = "Frame " + (index + 1) + " of " + session.keyframe_count + ". " + here + " Use the slider to box other orientations. " + labeled + " frames labeled.";
-  clearBtn.disabled = !boxes[index];
-  trainBtn.disabled = !labelInput.value.trim() || labeled === 0;
+    ? "Review this box; add points or draw a box to correct it."
+    : "No reliable track here. Tap the object or draw a correction box.";
+  meta.textContent = "Frame " + (index + 1) + " of " + session.keyframe_count + ". " + here + " Use the slider to review other orientations. " + labeled + " frames labeled.";
+  clearBtn.disabled = training || annotationBusy || !boxes[index];
+  trainBtn.disabled = training || annotationBusy || !labelInput.value.trim() || labeled < 2;
+  propagateBtn.disabled = training || annotationBusy || !boxes[index];
 }
 
 function pointerToImage(ev) {
@@ -515,7 +611,7 @@ function strokeBox(box, color) {
 }
 
 function loadMask(index) {
-  if (!session || !boxes[index]) return;
+  if (!session || !boxes[index] || !availableMasks.has(index)) return;
   const token = String(Date.now()) + "-" + index;
   maskTokens[index] = token;
   const image = new Image();
@@ -532,6 +628,12 @@ function paintStage() {
   ctx.drawImage(frameImage, 0, 0);
   const overlayMask = masks[Number(scrub.value)];
   if (overlayMask) ctx.drawImage(overlayMask, 0, 0);
+  for (const point of pointsByFrame[Number(scrub.value)] || []) {
+    ctx.beginPath();
+    ctx.arc(point.x, point.y, 5, 0, Math.PI * 2);
+    ctx.fillStyle = point.label ? "#3dcc7a" : "#ff6565";
+    ctx.fill();
+  }
   const saved = boxes[Number(scrub.value)];
   if (saved) strokeBox(saved, "#3dcc7a");
   if (draft) {
@@ -544,11 +646,16 @@ function paintStage() {
 }
 
 stage.addEventListener("pointerdown", (ev) => {
-  if (!session || !session.keyframe_count || viewMode !== "train" || !frameImage) return;
+  if (!session || !session.keyframe_count || viewMode !== "train" || !frameImage || annotationBusy || training) return;
   if (ev.button !== undefined && ev.button !== 0) return;
   clearError();
   try { stage.setPointerCapture(ev.pointerId); } catch (err) { /* synthetic events have no capture */ }
   const [x, y] = pointerToImage(ev);
+  if (selectionMode.value !== "box") {
+    submitTap(x, y);
+    ev.preventDefault();
+    return;
+  }
   masks[Number(scrub.value)] = null;
   draft = [x, y, x, y];
   drawing = true;
@@ -593,17 +700,52 @@ async function finishDraw(ev) {
   const y2 = Math.max(raw[1], raw[3]);
   if (x2 - x1 < 8 || y2 - y1 < 8) return;
   const index = Number(scrub.value);
+  annotationBusy = true;
+  scrub.disabled = true;
+  updateBusyControls();
   try {
     const data = await postJSON("/api/sessions/" + session.id + "/box", { index, x1, y1, x2, y2 });
-    boxes = data.boxes;
-    tapHint.classList.remove("on");
-    describeFrame();
-    paintStage();
-    loadMask(index);
+    applyAnnotation(data, index);
     if (labelInput.value.trim()) labelInput.focus();
   } catch (err) {
     showError(err.message);
+  } finally {
+    annotationBusy = false;
+    scrub.disabled = false;
+    updateBusyControls();
+    describeFrame();
   }
+}
+
+function applyAnnotation(data, index) {
+  boxes = data.boxes;
+  pointsByFrame = data.points_by_frame || pointsByFrame;
+  availableMasks = new Set(data.mask_indices || []);
+  masks = new Array(boxes.length).fill(null);
+  maskTokens = new Array(boxes.length).fill("");
+  tapHint.classList.remove("on");
+  describeFrame();
+  paintStage();
+  loadMask(index);
+}
+
+async function submitTap(x, y) {
+  const index = Number(scrub.value);
+  const previous = selectionMode.value === "tap" ? [] : (pointsByFrame[index] || []);
+  const points = [...previous, { x, y, label: selectionMode.value === "remove" ? 0 : 1 }];
+  annotationBusy = true;
+  scrub.disabled = true;
+  updateBusyControls();
+  describeFrame();
+  meta.textContent = "Selecting and tracking the object…";
+  try {
+    startAnnotationProgress();
+    const data = await postJSON("/api/sessions/" + session.id + "/tap", { index, points });
+    applyAnnotation(data, index);
+    if (selectionMode.value === "tap") selectionMode.value = "add";
+    progressEl.textContent = data.backend + " + " + data.tracker + ": " + data.elapsed_ms.toFixed(0) + " ms segmentation; " + data.track_ms.toFixed(0) + " ms tracking. Review the boxes.";
+  } catch (err) { showError(err.message); }
+  finally { stopAnnotationProgress(); annotationBusy = false; scrub.disabled = false; updateBusyControls(); describeFrame(); }
 }
 
 scrub.addEventListener("input", () => {
@@ -616,30 +758,45 @@ scrub.addEventListener("input", () => {
 });
 
 clearBtn.addEventListener("click", async () => {
-  if (!session) return;
+  if (!session || annotationBusy || training) return;
   clearError();
   const index = Number(scrub.value);
+  annotationBusy = true;
+  scrub.disabled = true;
+  updateBusyControls();
   try {
     const data = await postJSON("/api/sessions/" + session.id + "/box", { index, clear: true });
-    boxes = data.boxes;
-    masks[index] = null;
-    describeFrame();
-    paintStage();
+    applyAnnotation(data, index);
     if (!boxes.some(Boolean)) tapHint.classList.add("on");
   } catch (err) {
     showError(err.message);
+  } finally {
+    annotationBusy = false;
+    scrub.disabled = false;
+    updateBusyControls();
+    describeFrame();
   }
 });
 
 labelInput.addEventListener("input", () => {
-  trainBtn.disabled = !labelInput.value.trim() || !boxes.some(Boolean);
+  describeFrame();
 });
 
 trainBtn.addEventListener("click", async () => {
   clearError();
+  if (!session || annotationBusy || training) return;
   trainBtn.disabled = true;
   try {
-    await postJSON("/api/sessions/" + session.id + "/train", { label: labelInput.value });
+    await postJSON("/api/sessions/" + session.id + "/train", {
+      label: labelInput.value, tail_is_background: document.getElementById("backgroundTail").checked,
+    });
+    training = true;
+    updateBusyControls();
+    selectionMode.disabled = true;
+    clearBtn.disabled = true;
+    propagateBtn.disabled = true;
+    useModelBtn.disabled = true;
+    deleteModelBtn.disabled = true;
     poll();
   } catch (err) {
     showError(err.message);
@@ -660,13 +817,28 @@ function poll() {
       if (data.report && data.report.measured && data.report.anchor_map50 != null) {
         progressEl.textContent += " Anchor mAP50 " + Number(data.report.anchor_map50).toFixed(3) + ".";
       }
+      training = false;
+      updateBusyControls();
+      selectionMode.disabled = false;
+      useModelBtn.disabled = false;
+      describeFrame();
+      if (data.report) {
+        if (data.report.novel_map50 != null) progressEl.textContent += " Held-out class mAP50 " + Number(data.report.novel_map50).toFixed(3) + ".";
+        const ratio = data.report.anchor_retention_ratio;
+        progressEl.textContent += ratio == null ? " Retention could not be measured." : " Base-class retention " + (100 * ratio).toFixed(1) + "% (target 90%).";
+      }
       refreshModel();
       progressEl.textContent += " Switch to Inference to run this model.";
     }
     if (data.status === "error") {
       clearInterval(timerId);
       showError(data.message);
-      trainBtn.disabled = false;
+      training = false;
+      updateBusyControls();
+      selectionMode.disabled = false;
+      useModelBtn.disabled = false;
+      describeFrame();
+      refreshModel();
     }
   }, 500);
 }
@@ -686,7 +858,23 @@ function drawFrame(index) {
 
 function applyModelStatus(data) {
   modelNameEl.textContent = data.active_name;
-  resetModelBtn.disabled = !data.can_reset;
+  resetModelBtn.dataset.canReset = data.can_reset ? "yes" : "";
+  resetModelBtn.disabled = !data.can_reset || data.training;
+  modelCatalog = data.models || [];
+  savedModels.replaceChildren();
+  const base = document.createElement("option");
+  base.value = "base";
+  base.textContent = "Base model — " + data.base;
+  savedModels.appendChild(base);
+  for (const record of modelCatalog) {
+    const option = document.createElement("option");
+    option.value = record.id;
+    option.textContent = record.name + (record.active ? " (active)" : "");
+    savedModels.appendChild(option);
+    if (record.active) savedModels.value = record.id;
+  }
+  deleteModelBtn.disabled = data.training || savedModels.value === "base";
+  useModelBtn.disabled = data.training;
   resetModelBtn.textContent = data.can_reset ? "Reset to " + data.previous_name : "Reset to previous model";
 }
 
@@ -811,6 +999,15 @@ class Session:
     masks: list | None = None
     label: str | None = None
     progress: dict = field(default_factory=idle_progress)
+    points: dict = field(default_factory=dict)
+    manual: set = field(default_factory=set)
+    excluded: set = field(default_factory=set)
+    scores: list = field(default_factory=list)
+    tail_is_background: bool = False
+    annotation_progress: dict = field(
+        default_factory=lambda: {"status": "idle", "done": 0, "total": 0}
+    )
+    annotation_lock: object = field(default_factory=threading.RLock)
 
 
 class CameraRecorder:
@@ -890,6 +1087,7 @@ class TapYoloApp:
         epochs: int = 12,
         imgsz: int = 640,
         batch: int = 0,
+        anchor_dir: Path | None = None,
     ) -> None:
         self.model = model
         self.requested_device = requested_device
@@ -899,16 +1097,31 @@ class TapYoloApp:
         self.epochs = epochs
         self.imgsz = imgsz
         self.batch = batch
+        self.anchor_dir = anchor_dir
+        self.training_busy = False
         self.sessions: dict[str, Session] = {}
         self.lock = threading.Lock()
         self.torch_lock = threading.Lock()
-        self.segmenter_choice: SegmenterChoice = load_segmenter()
+        self.segmenter_choice: SegmenterChoice = load_segmenter(device=self.device)
+        self.video_tracker = load_video_tracker(device=self.device)
         self.active_weights = model
         self.weight_stack: list[str] = []
         latest = self._newest_weights()
         if latest and Path(latest).resolve() != Path(model).resolve():
             self.weight_stack.append(model)
             self.active_weights = latest
+        state_file = self.work_root / "active-model.json"
+        if state_file.is_file():
+            try:
+                saved_active = json.loads(state_file.read_text()).get("active")
+            except (ValueError, OSError):
+                saved_active = None
+            allowed = {
+                record["path"] for record in catalog(self.work_root, self.model)
+            } | {self.model}
+            if saved_active in allowed:
+                self.active_weights = saved_active
+                self.weight_stack = [] if saved_active == self.model else [self.model]
         self._yolo = None
         self._yolo_path: str | None = None
         self.recorder = CameraRecorder()
@@ -916,14 +1129,8 @@ class TapYoloApp:
     def _newest_weights(self) -> str | None:
         if not self.work_root.is_dir():
             return None
-        found = [
-            path
-            for path in self.work_root.rglob("best.pt")
-            if path.is_file() and path.parent.name == "weights"
-        ]
-        if not found:
-            return None
-        return str(max(found, key=lambda path: path.stat().st_mtime))
+        models = catalog(self.work_root, self.model)
+        return models[0]["path"] if models else None
 
     def health(self) -> dict:
         choice = self.segmenter_choice
@@ -934,6 +1141,11 @@ class TapYoloApp:
             "onnx_weights": choice.onnx_error is None,
             "onnx_error": choice.onnx_error,
             "model": self.model,
+            "learned_segmentation": choice.name != "fallback",
+            "segmenter_note": choice.onnx_error,
+            "tracker": self.video_tracker.name
+            if self.video_tracker
+            else "template fallback (install SAM 2.1 with python -m tapyolo.setup)",
         }
 
     def model_status(self) -> dict:
@@ -944,15 +1156,100 @@ class TapYoloApp:
             "previous": previous,
             "previous_name": None if previous is None else _weight_label(previous),
             "can_reset": previous is not None,
+            "models": [
+                {**record, "active": record["path"] == self.active_weights}
+                for record in catalog(self.work_root, self.model)
+            ],
+            "base": self.model,
+            "training": self.training_busy,
         }
 
+    def _persist_active(self):
+        path = self.work_root / "active-model.json"
+        temporary = path.with_suffix(".tmp")
+        temporary.write_text(json.dumps({"active": self.active_weights}))
+        temporary.replace(path)
+
+    def select_model(self, model_id):
+        with self.lock:
+            if self.training_busy:
+                raise ApiError(
+                    409, "Wait for training to finish before changing models"
+                )
+            selected = (
+                self.model
+                if model_id == "base"
+                else next(
+                    (
+                        r["path"]
+                        for r in catalog(self.work_root, self.model)
+                        if r["id"] == model_id
+                    ),
+                    None,
+                )
+            )
+            if selected is None:
+                raise ApiError(404, "model not found")
+            with self.torch_lock:
+                if selected != self.active_weights:
+                    self.weight_stack.append(self.active_weights)
+                    self.active_weights = selected
+                    self._yolo = None
+                    self._yolo_path = None
+                    self._persist_active()
+        return self.model_status()
+
+    def delete_model(self, model_id):
+        with self.lock:
+            if self.training_busy:
+                raise ApiError(
+                    409, "Wait for training to finish before deleting models"
+                )
+            record = next(
+                (r for r in catalog(self.work_root, self.model) if r["id"] == model_id),
+                None,
+            )
+            if record is None:
+                raise ApiError(404, "model not found")
+            directory = Path(record["path"]).resolve().parent
+            with self.torch_lock:
+                deleted = {
+                    str(path.resolve())
+                    for path in directory.glob("*.pt")
+                    if not path.is_symlink()
+                }
+                if str(Path(self.model).resolve()) in deleted:
+                    raise ApiError(409, "The base model cannot be deleted")
+                self.weight_stack = [
+                    w
+                    for w in self.weight_stack
+                    if str(Path(w).resolve()) not in deleted
+                ]
+                if str(Path(self.active_weights).resolve()) in deleted:
+                    self.active_weights = (
+                        self.weight_stack.pop() if self.weight_stack else self.model
+                    )
+                self._yolo = None
+                self._yolo_path = None
+                for path in deleted:
+                    Path(path).unlink()
+                (directory / "tapyolo.json").unlink(missing_ok=True)
+                self._persist_active()
+        return self.model_status()
+
     def reset_model(self) -> dict:
-        with self.torch_lock:
-            if not self.weight_stack:
-                raise ApiError(409, "No previous model to restore")
-            self.active_weights = self.weight_stack.pop()
-            self._yolo = None
-            self._yolo_path = None
+        with self.lock:
+            if self.training_busy:
+                raise ApiError(
+                    409, "Wait for training to finish before changing models"
+                )
+            with self.torch_lock:
+                if not self.weight_stack:
+                    raise ApiError(409, "No previous model to restore")
+                self.active_weights = self.weight_stack.pop()
+                self._persist_active()
+                self._yolo = None
+                self._yolo_path = None
         return self.model_status()
 
     def open_frames(self, frames: list[np.ndarray], fps: float) -> Session:
@@ -960,7 +1257,9 @@ class TapYoloApp:
         session_id = uuid.uuid4().hex[:12]
         directory = self.work_root / "sessions" / session_id
         saved = save_capture(bundle, directory)
-        session = Session(id=session_id, bundle=bundle, directory=directory, saved=saved)
+        session = Session(
+            id=session_id, bundle=bundle, directory=directory, saved=saved
+        )
         session.boxes = [None] * len(bundle.keyframes)
         session.masks = [None] * len(bundle.keyframes)
         with self.lock:
@@ -982,7 +1281,9 @@ class TapYoloApp:
             "sample_method": bundle.sample_method,
             "warning": bundle.warning,
             "segmenter": self.segmenter_choice.name,
-            "negative_label_paths": [str(path) for path in session.saved.negative_label_paths],
+            "negative_label_paths": [
+                str(path) for path in session.saved.negative_label_paths
+            ],
         }
 
     def _require_frame(self, session: Session, index: int) -> None:
@@ -997,15 +1298,28 @@ class TapYoloApp:
     def box_state(self, session: Session, index: int | None = None) -> dict:
         stored = session.boxes or []
         boxes = [None if box is None else list(box) for box in stored]
-        current = None if index is None or stored[index] is None else list(stored[index])
+        current = (
+            None if index is None or stored[index] is None else list(stored[index])
+        )
         return {
             "index": index,
             "bbox": current,
             "boxes": boxes,
             "labeled_count": sum(box is not None for box in stored),
+            "points": session.points.get(index, []),
+            "mask_indices": [
+                i for i, mask in enumerate(session.masks or []) if mask is not None
+            ],
+            "scores": session.scores,
+            "review": [i for i, box in enumerate(stored) if box is None],
+            "points_by_frame": session.points,
         }
 
-    def set_box(self, session: Session, index: int, x1: int, y1: int, x2: int, y2: int) -> dict:
+    def set_box(
+        self, session: Session, index: int, x1: int, y1: int, x2: int, y2: int
+    ) -> dict:
+        if session.progress["status"] == "running":
+            raise ApiError(409, "Wait for training before editing this session")
         self._require_frame(session, index)
         width, height = session.bundle.width, session.bundle.height
         left, right = sorted((int(x1), int(x2)))
@@ -1017,20 +1331,149 @@ class TapYoloApp:
         if right - left < 4 or bottom - top < 4:
             raise ApiError(400, "Box is too small")
         session.boxes[index] = (left, top, right, bottom)
-        frame = session.bundle.keyframes[index]
-        try:
-            session.masks[index] = object_mask(frame, session.boxes[index])
-        except Exception:
-            fallback = np.zeros((height, width), np.uint8)
-            fallback[top : bottom + 1, left : right + 1] = 1
-            session.masks[index] = fallback
+        # A manually corrected rectangle is authoritative. Do not cut pieces
+        # away again using the color heuristic that the user is correcting.
+        mask = np.zeros((height, width), np.uint8)
+        mask[top : bottom + 1, left : right + 1] = 1
+        session.masks[index] = mask
+        session.manual.add(index)
+        session.excluded.discard(index)
+        session.points.pop(index, None)
         return self.box_state(session, index)
 
     def clear_box(self, session: Session, index: int) -> dict:
+        if session.progress["status"] == "running":
+            raise ApiError(409, "Wait for training before editing this session")
         self._require_frame(session, index)
         session.boxes[index] = None
         session.masks[index] = None
+        session.manual.discard(index)
+        session.excluded.add(index)
+        session.points.pop(index, None)
         return self.box_state(session, index)
+
+    def tap(self, session, index, points):
+        if session.progress["status"] == "running":
+            raise ApiError(409, "Wait for training before editing this session")
+        self._require_frame(session, index)
+        if not isinstance(points, list) or not 1 <= len(points) <= 32:
+            raise ApiError(400, "Supply 1–32 foreground/background points")
+        coords, labels = [], []
+        for point in points:
+            if not isinstance(point, dict):
+                raise ApiError(400, "Invalid point")
+            x, y, label = int(point["x"]), int(point["y"]), int(point["label"])
+            if (
+                not 0 <= x < session.bundle.width
+                or not 0 <= y < session.bundle.height
+                or label not in (0, 1)
+            ):
+                raise ApiError(
+                    400, "Point is outside the image or has an invalid label"
+                )
+            coords.append([x, y])
+            labels.append(label)
+        if 1 not in labels:
+            raise ApiError(400, "Add a foreground point first")
+        started = time.perf_counter()
+        try:
+            with self.torch_lock:
+                mask, detail = self.segmenter_choice.segmenter.segment_prompt(
+                    session.bundle.keyframes[index], coords, labels
+                )
+        except ValueError as exc:
+            raise ApiError(422, str(exc)) from exc
+        bbox = mask_to_bbox(mask)
+        session.boxes[index] = bbox
+        session.masks[index] = mask
+        session.points[index] = points
+        session.manual.add(index)
+        session.excluded.discard(index)
+        segmentation_ms = (time.perf_counter() - started) * 1000
+        tracking_started = time.perf_counter()
+        state = self.propagate(session, index)
+        state.update(
+            {
+                "elapsed_ms": segmentation_ms,
+                "track_ms": (time.perf_counter() - tracking_started) * 1000,
+                "backend": self.segmenter_choice.name,
+                "detail": detail,
+            }
+        )
+        return state
+
+    def propagate(self, session, index):
+        if session.progress["status"] == "running":
+            raise ApiError(409, "Wait for training before editing this session")
+        self._require_frame(session, index)
+        box = session.boxes[index]
+        if box is None:
+            raise ApiError(409, "Select an object before propagating")
+        session.annotation_progress = {"status": "running", "done": 0, "total": 0}
+        try:
+            if self.video_tracker is not None:
+                dense = session.bundle.tracking_frames or session.bundle.keyframes
+                mapping = (
+                    session.bundle.keyframe_indices
+                    if session.bundle.tracking_frames
+                    else list(range(len(dense)))
+                )
+                mask = session.masks[index]
+                if mask is None:
+                    raise ApiError(
+                        409, "Tap the object or draw a correction before propagating"
+                    )
+                corrections = {
+                    mapping[offset]: session.masks[offset]
+                    for offset in session.manual
+                    if session.masks[offset] is not None
+                }
+
+                def progress(done, total):
+                    session.annotation_progress = {
+                        "status": "running",
+                        "done": done,
+                        "total": total,
+                    }
+
+                with self.torch_lock:
+                    result = self.video_tracker.propagate(
+                        dense,
+                        mapping[index],
+                        mask,
+                        mapping,
+                        corrections=corrections,
+                        excluded={mapping[offset] for offset in session.excluded},
+                        progress=progress,
+                    )
+            else:
+                result = propagate_bidirectional(session.bundle.keyframes, index, box)
+            session.scores = result.scores
+            for offset, proposed in enumerate(result.boxes):
+                if offset in session.manual or offset in session.excluded:
+                    continue
+                session.boxes[offset] = proposed
+                session.masks[offset] = (
+                    result.masks[offset] if self.video_tracker is not None else None
+                )
+            session.annotation_progress = {
+                **session.annotation_progress,
+                "status": "done",
+            }
+        except Exception:
+            session.annotation_progress = {
+                **session.annotation_progress,
+                "status": "error",
+            }
+            raise
+        state = self.box_state(session, index)
+        state["tracker"] = result.backend
+        state["score_type"] = (
+            "mask presence, not confidence"
+            if self.video_tracker
+            else "template correlation"
+        )
+        return state
 
     def mask_png(self, session: Session, index: int) -> bytes:
         self._require_frame(session, index)
@@ -1050,10 +1493,13 @@ class TapYoloApp:
         import shutil
 
         if not session.boxes or not any(box is not None for box in session.boxes):
-            raise ApiError(409, "Draw a box on at least one frame before training")
+            raise ApiError(
+                409, "Tap the object or draw a correction box before training"
+            )
         dest = session.directory / "labeled"
         if dest.exists():
-            shutil.rmtree(dest)
+            # Older checkpoint provenance may refer to a previous export.
+            dest = session.directory / ("labeled-" + uuid.uuid4().hex[:8])
         image_dir = dest / "images"
         label_dir = dest / "labels"
         image_dir.mkdir(parents=True)
@@ -1061,19 +1507,27 @@ class TapYoloApp:
         width, height = session.bundle.width, session.bundle.height
         cv2 = _cv2()
         masks = session.masks or [None] * len(session.boxes)
-        for path, box, mask in zip(session.saved.keyframe_paths, session.boxes, masks, strict=True):
+        for path, box, mask in zip(
+            session.saved.keyframe_paths, session.boxes, masks, strict=True
+        ):
             if box is None:
                 continue
             image = cv2.imread(str(path))
             if image is None:
                 continue
             if mask is None or mask.shape[:2] != image.shape[:2]:
-                mask = object_mask(image, box)
+                mask = np.zeros(image.shape[:2], np.uint8)
+                x1, y1, x2, y2 = box
+                mask[y1 : y2 + 1, x1 : x2 + 1] = 1
             seed = zlib.adler32(path.stem.encode("utf-8")) & 0xFFFFFFFF
             views = training_views(image, box, mask, rng=np.random.default_rng(seed))
             for offset, (view, tight) in enumerate(views):
                 stem = path.stem if offset == 0 else f"{path.stem}_bg{offset - 1:02d}"
-                cv2.imwrite(str(image_dir / f"{stem}.jpg"), view, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+                cv2.imwrite(
+                    str(image_dir / f"{stem}.jpg"),
+                    view,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), 90],
+                )
                 write_yolo_label(
                     label_dir / f"{stem}.txt",
                     0,
@@ -1081,11 +1535,15 @@ class TapYoloApp:
                 )
             gone = scene_without_object(image, mask)
             gone_stem = f"{path.stem}_gone"
-            cv2.imwrite(str(image_dir / f"{gone_stem}.jpg"), gone, [int(cv2.IMWRITE_JPEG_QUALITY), 90])
+            cv2.imwrite(
+                str(image_dir / f"{gone_stem}.jpg"),
+                gone,
+                [int(cv2.IMWRITE_JPEG_QUALITY), 90],
+            )
             write_empty_label(label_dir / f"{gone_stem}.txt")
         for image_path, label_path in zip(
-            session.saved.negative_paths,
-            session.saved.negative_label_paths,
+            session.saved.negative_paths if session.tail_is_background else [],
+            session.saved.negative_label_paths if session.tail_is_background else [],
             strict=True,
         ):
             shutil.copyfile(image_path, image_dir / image_path.name)
@@ -1094,27 +1552,48 @@ class TapYoloApp:
 
     def start_training(self, session: Session, label: str) -> dict:
         if not session.boxes or not any(box is not None for box in session.boxes):
-            raise ApiError(409, "Draw a box on at least one frame before training")
+            raise ApiError(
+                409, "Tap the object or draw a correction box before training"
+            )
+        if sum(box is not None for box in session.boxes) < 2:
+            raise ApiError(
+                409,
+                "Label at least two keyframes so training and validation are separate",
+            )
         cleaned = clean_label(label)
+        with self.lock:
+            if self.training_busy:
+                raise ApiError(409, "A training job is already running")
+            self.training_busy = True
         session.label = cleaned
         session.progress = {
             "status": "running",
             "epoch": 0,
-            "epochs": LABELED_EPOCHS,
+            "epochs": self.epochs,
             "fraction": 0.0,
-            "message": f"Segmenting {cleaned}, then training it without the background.",
+            "message": f"Preparing {cleaned} and rehearsal images for {self.epochs} epochs.",
             "remaining_s": None,
             "weights": None,
             "report": None,
         }
-        thread = threading.Thread(target=self._train, args=(session, cleaned), daemon=True)
-        thread.start()
+        thread = threading.Thread(
+            target=self._train, args=(session, cleaned), daemon=True
+        )
+        try:
+            thread.start()
+        except RuntimeError:
+            with self.lock:
+                self.training_busy = False
+            session.progress = idle_progress()
+            raise
         return session.progress
 
     def _train(self, session: Session, label: str) -> None:
         try:
             labeled = self.export_labeled_set(session)
-            (session.directory / "classes.txt").write_text(label + "\n", encoding="utf-8")
+            (session.directory / "classes.txt").write_text(
+                label + "\n", encoding="utf-8"
+            )
 
             def progress(epoch: int, epochs: int, remaining: float) -> None:
                 session.progress = {
@@ -1132,24 +1611,67 @@ class TapYoloApp:
 
             batch = batch_for_device(self.device, self.batch or None)
             with self.torch_lock:
-                result = train_labeled_class(
+                inherited = (
+                    []
+                    if self.active_weights == self.model
+                    else replay_sources(self.active_weights, self.work_root)
+                )
+                previous_sources = [
+                    (root, name)
+                    for root, name in inherited
+                    if root.parent.resolve() != session.directory.resolve()
+                ]
+                result = train_detection_head(
                     labeled,
                     label,
-                    epochs=LABELED_EPOCHS,
-                    model=self.model,
+                    epochs=self.epochs,
+                    model=self.active_weights
+                    if (Path(self.active_weights).parent / "tapyolo.json").is_file()
+                    else self.model,
                     device=self.device,
-                    project=session.directory / "run",
+                    project=session.directory / "run" / uuid.uuid4().hex[:8],
                     imgsz=self.imgsz,
-                    batch=min(batch, 4),
+                    batch=batch,
+                    anchor_dir=self.anchor_dir,
+                    replay_sources=previous_sources,
                     progress_callback=progress,
                 )
             report = None
+            if result.weights:
+                from tapyolo.validate import evaluate_training_run
+
+                session.progress["message"] = (
+                    "Scoring held-out frames and base-class retention"
+                )
+                with self.torch_lock:
+                    report = evaluate_training_run(
+                        self.model,
+                        result.weights,
+                        Path(result.dataset_root),
+                        device=self.device,
+                        imgsz=self.imgsz,
+                    )
+                metadata = {
+                    "sources": [
+                        {"root": str(labeled.resolve()), "name": label},
+                        *[
+                            {"root": str(root), "name": name}
+                            for root, name in previous_sources
+                        ],
+                    ],
+                    "report": report,
+                    "epochs": result.epochs,
+                }
+                (Path(result.weights).parent / "tapyolo.json").write_text(
+                    json.dumps(metadata, indent=2)
+                )
             if result.weights and result.weights != self.active_weights:
                 with self.torch_lock:
                     self.weight_stack.append(self.active_weights)
                     self.active_weights = result.weights
                     self._yolo = None
                     self._yolo_path = None
+                    self._persist_active()
             session.progress = {
                 "status": "done",
                 "epoch": result.epochs,
@@ -1173,6 +1695,10 @@ class TapYoloApp:
                 "report": None,
             }
 
+        finally:
+            with self.lock:
+                self.training_busy = False
+
     def infer(self, image: np.ndarray) -> dict:
         import time
 
@@ -1185,7 +1711,11 @@ class TapYoloApp:
                     self._yolo_path = self.active_weights
                 started = time.perf_counter()
                 result = self._yolo.predict(
-                    image, device=self.device, verbose=False, conf=0.15, imgsz=self.imgsz
+                    image,
+                    device=self.device,
+                    verbose=False,
+                    conf=0.15,
+                    imgsz=self.imgsz,
                 )[0]
                 elapsed_ms = (time.perf_counter() - started) * 1000.0
         except Exception as exc:
@@ -1198,7 +1728,9 @@ class TapYoloApp:
                 boxes.append(
                     {
                         "class_id": class_id,
-                        "class_name": names.get(class_id, str(class_id)) if isinstance(names, dict) else names[class_id],
+                        "class_name": names.get(class_id, str(class_id))
+                        if isinstance(names, dict)
+                        else names[class_id],
                         "confidence": float(box.conf),
                         "xyxy": [float(v) for v in box.xyxy[0].tolist()],
                     }
@@ -1219,7 +1751,9 @@ def make_server(app: TapYoloApp, host: str, port: int) -> ThreadingHTTPServer:
 def serve(app: TapYoloApp, host: str = "127.0.0.1", port: int = 7860) -> None:
     httpd = make_server(app, host, port)
     print(f"TapYOLO UI at http://{host}:{port}")
-    print(f"Resolved device: {app.device} (requested {app.requested_device}). Segmenter: {app.segmenter_choice.name}.")
+    print(
+        f"Resolved device: {app.device} (requested {app.requested_device}). Segmenter: {app.segmenter_choice.name}."
+    )
     print(f"Active model: {_weight_label(app.active_weights)}")
     try:
         httpd.serve_forever()
@@ -1238,6 +1772,8 @@ def _handler_class(app: TapYoloApp):
                 self._get()
             except ApiError as exc:
                 self._send_json(exc.status, {"error": str(exc)})
+            except (ValueError, KeyError, TypeError) as exc:
+                self._send_json(400, {"error": str(exc)})
             except Exception as exc:
                 self._send_json(500, {"error": str(exc)})
 
@@ -1246,6 +1782,8 @@ def _handler_class(app: TapYoloApp):
                 self._post()
             except ApiError as exc:
                 self._send_json(exc.status, {"error": str(exc)})
+            except (ValueError, KeyError, TypeError) as exc:
+                self._send_json(400, {"error": str(exc)})
             except Exception as exc:
                 self._send_json(500, {"error": str(exc)})
 
@@ -1271,12 +1809,22 @@ def _handler_class(app: TapYoloApp):
                     return
                 self._send(200, jpeg, "image/jpeg")
                 return
+            if path.endswith("/annotation-progress") and path.startswith(
+                "/api/sessions/"
+            ):
+                session = self._session_from(path.split("/")[3])
+                self._send_json(200, session.annotation_progress)
+                return
             if path.endswith("/progress") and path.startswith("/api/sessions/"):
                 session = self._session_from(path.split("/")[3])
                 self._send_json(200, session.progress)
                 return
             parts = path.strip("/").split("/")
-            if len(parts) == 5 and parts[:2] == ["api", "sessions"] and parts[3] == "masks":
+            if (
+                len(parts) == 5
+                and parts[:2] == ["api", "sessions"]
+                and parts[3] == "masks"
+            ):
                 session = self._session_from(parts[2])
                 name = parts[4]
                 if not name.endswith(".png"):
@@ -1284,7 +1832,11 @@ def _handler_class(app: TapYoloApp):
                 body = app.mask_png(session, int(name[:-4]))
                 self._send(200, body, "image/png")
                 return
-            if len(parts) == 5 and parts[:2] == ["api", "sessions"] and parts[3] == "frames":
+            if (
+                len(parts) == 5
+                and parts[:2] == ["api", "sessions"]
+                and parts[3] == "frames"
+            ):
                 session = self._session_from(parts[2])
                 name = parts[4]
                 if not name.endswith(".jpg"):
@@ -1305,7 +1857,9 @@ def _handler_class(app: TapYoloApp):
             path = urlparse(self.path).path
             if path == "/api/sessions":
                 data = self._body()
-                content_type = self.headers.get("Content-Type", "application/octet-stream")
+                content_type = self.headers.get(
+                    "Content-Type", "application/octet-stream"
+                )
                 try:
                     frames, fps = decode_upload(data, content_type)
                     session = app.open_frames(frames, fps)
@@ -1327,6 +1881,12 @@ def _handler_class(app: TapYoloApp):
                 session = app.open_frames(frames, fps)
                 self._send_json(200, app.session_payload(session))
                 return
+            if path == "/api/model/select":
+                self._send_json(200, app.select_model(self._json().get("id")))
+                return
+            if path == "/api/model/delete":
+                self._send_json(200, app.delete_model(self._json().get("id")))
+                return
             if path == "/api/model/reset":
                 self._send_json(200, app.reset_model())
                 return
@@ -1335,30 +1895,61 @@ def _handler_class(app: TapYoloApp):
                 self._send_json(200, app.infer(image))
                 return
             parts = path.strip("/").split("/")
-            if len(parts) == 4 and parts[:2] == ["api", "sessions"] and parts[3] == "box":
+            if (
+                len(parts) == 4
+                and parts[:2] == ["api", "sessions"]
+                and parts[3] in {"tap", "propagate"}
+            ):
+                session = self._session_from(parts[2])
+                payload = self._json()
+                index = int(payload.get("index", 0))
+                with session.annotation_lock:
+                    result = (
+                        app.tap(session, index, payload.get("points"))
+                        if parts[3] == "tap"
+                        else app.propagate(session, index)
+                    )
+                self._send_json(200, result)
+                return
+            if (
+                len(parts) == 4
+                and parts[:2] == ["api", "sessions"]
+                and parts[3] == "box"
+            ):
                 session = self._session_from(parts[2])
                 payload = self._json()
                 index = int(payload["index"])
                 if payload.get("clear"):
-                    self._send_json(200, app.clear_box(session, index))
+                    with session.annotation_lock:
+                        result = app.clear_box(session, index)
+                    self._send_json(200, result)
                     return
-                self._send_json(
-                    200,
-                    app.set_box(
+                with session.annotation_lock:
+                    result = app.set_box(
                         session,
                         index,
                         int(payload["x1"]),
                         int(payload["y1"]),
                         int(payload["x2"]),
                         int(payload["y2"]),
-                    ),
-                )
+                    )
+                self._send_json(200, result)
                 return
-            if len(parts) == 4 and parts[:2] == ["api", "sessions"] and parts[3] == "train":
+            if (
+                len(parts) == 4
+                and parts[:2] == ["api", "sessions"]
+                and parts[3] == "train"
+            ):
                 session = self._session_from(parts[2])
                 payload = self._json()
                 try:
-                    progress = app.start_training(session, str(payload.get("label", "")))
+                    with session.annotation_lock:
+                        session.tail_is_background = (
+                            payload.get("tail_is_background") is True
+                        )
+                        progress = app.start_training(
+                            session, str(payload.get("label", ""))
+                        )
                 except ValueError as exc:
                     raise ApiError(400, str(exc)) from exc
                 self._send_json(200, progress)
@@ -1366,7 +1957,9 @@ def _handler_class(app: TapYoloApp):
             raise ApiError(404, "not found")
 
         def _session_from(self, session_id: str) -> Session:
-            if len(session_id) != 12 or any(ch not in "0123456789abcdef" for ch in session_id):
+            if len(session_id) != 12 or any(
+                ch not in "0123456789abcdef" for ch in session_id
+            ):
                 raise ApiError(404, "session not found")
             session = app.sessions.get(session_id)
             if session is None:
@@ -1375,6 +1968,8 @@ def _handler_class(app: TapYoloApp):
 
         def _body(self) -> bytes:
             length = int(self.headers.get("Content-Length", "0"))
+            if length < 0:
+                raise ApiError(400, "Content-Length must be non-negative")
             if length > MAX_UPLOAD_BYTES:
                 raise ApiError(413, "upload exceeds 80 MB")
             return self.rfile.read(length) if length else b""
