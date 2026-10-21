@@ -6,11 +6,20 @@ For the investigation history, design decisions, complete change summary, and me
 
 ## Setup
 
-Python 3.11–3.12 and `uv` are required. Torch/torchvision use the CUDA 12.4 index.
+Python 3.11–3.12, Node.js 22+, and `uv` are required. Torch/torchvision use the CUDA 12.4 index.
 
 ```bash
 uv sync --frozen --extra dev
 uv run python -m tapyolo.setup
+```
+
+Install and build the Astro interface once:
+
+```bash
+cd web
+npm install
+npm run build
+cd ..
 ```
 
 Setup downloads official MobileSAM weights (~39 MB), SAM 2.1 tiny video weights (~75 MB), and COCO128 (~7 MB) into the gitignored `weights/` directory. It is safe to rerun. Production training samples 25 real rehearsal images, holding the other originals out for validation. Synthetic anchors remain available only as test/demo fixtures.
@@ -20,6 +29,8 @@ uv run python -m tapyolo.main --model yolo11n.pt --device cuda:0
 ```
 
 Open `http://127.0.0.1:7860`. CUDA falls back to MPS or CPU when unavailable. CPU segmentation and training can be substantially slower; the project does not claim the GPU timing budgets on CPU. The default YOLO checkpoint can download on first use.
+
+For frontend development, start the Python app as above, then in a second terminal run `cd web && npm run dev` and open `http://127.0.0.1:4321`. Astro proxies `/api` requests to the local Python service. After changing the interface, run `npm run build` from `web` to update the UI served at port 7860.
 
 ## Label and train
 

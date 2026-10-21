@@ -1,0 +1,142 @@
+---
+import '../styles/global.css';
+import '@fontsource-variable/manrope';
+import '@fontsource/ibm-plex-mono/400.css';
+import '@fontsource/ibm-plex-mono/500.css';
+---
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="theme-color" content="#f3f4f0" />
+    <meta name="description" content="Select an object in a video, review its track, and adapt a YOLO detector." />
+    <title>TapYOLO — Video labeling workspace</title>
+  </head>
+  <body>
+    <div class="app-shell">
+      <aside class="rail" aria-label="Workspace navigation">
+        <a class="brand" href="#workspace" aria-label="TapYOLO home">
+          <span class="brand-mark" aria-hidden="true"><span></span><span></span><span></span><span></span></span>
+          <span class="brand-word">tap<span>yolo</span></span>
+        </a>
+        <div class="rail-label">WORKSPACE</div>
+        <a class="rail-link active" href="#workspace"><span class="nav-glyph glyph-frame" aria-hidden="true"></span>Label a video</a>
+        <a class="rail-link" href="#saved-models"><span class="nav-glyph glyph-stack" aria-hidden="true"></span>Saved models</a>
+        <div class="rail-spacer"></div>
+        <div class="device-card">
+          <span class="device-indicator" aria-hidden="true"></span>
+          <div><span class="device-label">LOCAL RUNTIME</span><span id="health">Connecting to the local runtime…</span></div>
+        </div>
+        <div class="rail-foot">Private by design <span>·</span> Runs on this device</div>
+      </aside>
+
+      <main id="workspace" class="main-shell">
+        <header class="topbar">
+          <div class="breadcrumb"><span>Workspace</span><span class="crumb-slash">/</span><strong>New labeling session</strong></div>
+          <div class="top-actions">
+            <span id="modelName" class="active-model"></span>
+            <div class="mode-switch" aria-label="Workspace mode"><button id="modeTrain" class="selected" type="button">Train</button><button id="modeInfer" type="button">Inference</button></div>
+            <button id="resetModel" class="quiet-button" type="button" disabled>Reset model</button>
+          </div>
+        </header>
+
+        <div class="page-content">
+          <section class="intro-row" aria-labelledby="page-title">
+            <div><p class="eyebrow">VIDEO ANNOTATION <span class="eyebrow-rule"></span> MODEL ADAPTATION</p><h1 id="page-title">Teach a model to see <em>your</em> object.</h1><p class="intro-copy">Select it once. Review the track. Train locally on the frames that matter.</p></div>
+            <div class="stepper" aria-label="Workflow: Capture, select, review, train"><div class="step active"><span>01</span>Capture</div><span class="step-line"></span><div class="step"><span>02</span>Select</div><span class="step-line"></span><div class="step"><span>03</span>Review</div><span class="step-line"></span><div class="step"><span>04</span>Train</div></div>
+          </section>
+
+          <section class="workspace-grid" aria-label="Video labeling controls">
+            <section class="viewer-column" aria-label="Clip review">
+              <div class="capture-bar">
+                <div class="capture-left">
+                  <div class="rec-clock"><span id="dot"></span><span id="timer">00:00</span></div>
+                  <button id="record" class="record-button" type="button"><span class="record-glyph" aria-hidden="true"></span>Record</button>
+                  <button id="stop" class="stop-button" type="button" disabled><span class="stop-glyph" aria-hidden="true"></span>Stop</button>
+                  <span class="capture-divider"></span>
+                  <label class="camera-field"><span>Camera</span><select id="camera" aria-label="Camera"><option value="">Choose camera</option></select></label>
+                </div>
+                <label class="file-button"><span class="upload-glyph" aria-hidden="true">↑</span>Open video<input id="file" type="file" accept="video/*" /></label>
+              </div>
+
+              <div class="media-shell">
+                <div class="media-heading"><div class="media-title"><span class="media-live-dot"></span><strong>Clip review</strong><span id="frameStatus">Waiting for a video</span></div><span class="media-hint">TAP TO SELECT · DRAG TO DRAW A BOX</span></div>
+                <div id="view" class="media-stage">
+                  <div id="emptyState" class="empty-state">
+                    <div class="empty-illustration" aria-hidden="true"><div class="scan-corner tl"></div><div class="scan-corner tr"></div><div class="scan-corner bl"></div><div class="scan-corner br"></div><div class="target-ring"><span></span></div><span class="crosshair crosshair-h"></span><span class="crosshair crosshair-v"></span></div>
+                    <h2>Your next clip starts here</h2><p>Record a short view or open a video file.<br />Your footage stays on this device.</p>
+                    <div class="empty-actions"><button id="emptyRecord" class="empty-record" type="button"><span class="record-glyph" aria-hidden="true"></span>Record a clip</button><label class="empty-open">Open video<input id="emptyFile" type="file" accept="video/*" /></label></div>
+                    <span class="empty-footnote"><span aria-hidden="true">⌘</span> No uploads. No cloud processing.</span>
+                  </div>
+                  <video id="preview" autoplay playsinline muted></video>
+                  <canvas id="stage" width="640" height="360"></canvas>
+                  <canvas id="overlay"></canvas>
+                  <p id="tapHint">Tap the object once. Add or exclude points to refine its selection.</p>
+                </div>
+                <div class="timeline">
+                  <div class="timeline-meta"><span><strong>KEYFRAME TIMELINE</strong><span id="timelineCount">No frames yet</span></span><span class="timeline-shortcut">← <span>→</span> Browse frames</span></div>
+                  <input id="scrub" type="range" min="0" max="0" value="0" disabled aria-label="Review keyframes" />
+                  <div class="timeline-ends"><span>START</span><span>END</span></div>
+                </div>
+              </div>
+              <div id="meta" class="status-note" role="status" aria-live="polite">Start by recording a 3–8 second clip, or open a video from your device.</div>
+            </section>
+
+            <aside class="inspector" aria-label="Selection and training settings">
+              <div class="inspector-head"><div><p class="eyebrow">ANNOTATION</p><h2>Selection tools</h2></div><span class="inspector-number">01</span></div>
+              <p class="inspector-copy">Start with a tap. Refine any uncertain frames before training.</p>
+
+              <label class="control-label" for="selectionMode">Active tool</label>
+              <div class="select-wrap"><select id="selectionMode"><option value="tap">Tap object · New selection</option><option value="add">Add foreground point</option><option value="remove">Exclude background point</option><option value="box">Draw correction box</option></select><span class="select-chevron" aria-hidden="true">⌄</span></div>
+              <p class="control-hint">Choose a tool, then click or draw on the video.</p>
+              <button id="propagate" class="secondary-button propagate-button" type="button" disabled><span aria-hidden="true">↗</span>Propagate correction</button>
+
+              <div class="rule"></div>
+              <div class="label-heading"><label class="control-label" for="label">Object class</label><span class="optional-tag">REQUIRED TO TRAIN</span></div>
+              <input id="label" class="text-input" placeholder="e.g. cordless drill" autocomplete="off" />
+              <div class="review-actions"><button id="clearBox" class="secondary-button" type="button" disabled>Clear this frame</button></div>
+              <label class="toggle-row"><input id="backgroundTail" type="checkbox" /><span class="toggle-visual" aria-hidden="true"></span><span><strong>Object leaves the frame</strong><small>Absent during the final second</small></span></label>
+              <div class="rule training-rule"></div>
+              <div class="training-footer"><div><p class="eyebrow">NEXT STEP</p><p class="training-caption">Review at least two frames<br />to prepare your training set.</p></div><span class="training-arrow" aria-hidden="true">↓</span></div>
+              <button id="train" class="train-button" type="button" disabled><span>Train model</span><span class="train-arrow" aria-hidden="true">→</span></button>
+              <div class="progress-track"><div class="bar"><div id="fill"></div></div></div>
+              <p id="progress">Waiting for a clip</p>
+            </aside>
+          </section>
+
+          <section class="lower-grid" aria-label="Models and inference">
+            <section id="saved-models" class="lower-card models-card">
+              <div class="lower-card-heading"><span class="lower-icon model-icon" aria-hidden="true">◈</span><div><p class="eyebrow">YOUR LIBRARY</p><h2>Saved models</h2></div><span class="lower-card-index">01</span></div>
+              <p class="lower-description">Choose a detector for inference, or manage your trained checkpoints.</p>
+              <label class="control-label" for="savedModels">Model</label><div class="select-wrap"><select id="savedModels"></select><span class="select-chevron" aria-hidden="true">⌄</span></div>
+              <div class="lower-actions"><button id="useModel" class="secondary-button" type="button">Use selected model</button><button id="deleteModel" class="text-action" type="button" disabled>Delete</button></div>
+              <p class="fine-print">Deleting a model keeps its captures and labels.</p>
+            </section>
+            <section id="live" class="lower-card inference-card">
+              <div class="lower-card-heading"><span class="lower-icon inference-icon" aria-hidden="true">◎</span><div><p class="eyebrow">LIVE DETECTION</p><h2>Inference preview</h2></div><span class="live-badge"><span></span>LOCAL</span></div>
+              <p id="liveStats" class="inference-message">Switch to Inference to see your selected model detect objects from the camera feed.</p>
+              <div class="inference-visual" aria-hidden="true"><span class="inference-grid"></span><span class="inference-box"><i>OBJECT</i></span><span class="inference-scan"></span><span class="inference-corner c1"></span><span class="inference-corner c2"></span></div>
+            </section>
+          </section>
+          <footer class="page-footer"><span>TapYOLO <span class="footer-sep">/</span> Local video labeling</span><span>Frames are processed on your device.</span></footer>
+          <p id="error" role="alert" aria-live="polite"></p>
+        </div>
+      </main>
+    </div>
+    <script>
+      import '../scripts/app.js';
+      const mainInput = document.getElementById('file');
+      const mirrorInput = document.getElementById('emptyFile');
+      mirrorInput.addEventListener('change', () => {
+        if (mirrorInput.files?.length) {
+          const transfer = new DataTransfer();
+          transfer.items.add(mirrorInput.files[0]);
+          mainInput.files = transfer.files;
+          mainInput.dispatchEvent(new Event('change', { bubbles: true }));
+        }
+      });
+      document.getElementById('emptyRecord').addEventListener('click', () => document.getElementById('record').click());
+    </script>
+  </body>
+</html>

@@ -8,6 +8,9 @@ wheels/
 
 # Virtual environments
 .venv
+web/node_modules/
+web/.astro/
+.playwright-mcp/
 
 # Tool caches
 .pytest_cache/
